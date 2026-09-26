@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+
+data/
+cache/
+logs/
+
+outputs/*.tsv
+outputs/*.parquet
+outputs/*.json
+
+models/
+artifacts/
+
+.ipynb_checkpoints/
+.DS_Store

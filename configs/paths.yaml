@@ -1,0 +1,7 @@
+project_root: /home/arjunshenoy13/Projects/Hackathons/amazon-ml-challenge
+student_resource: /home/arjunshenoy13/Projects/Hackathons/amazon-ml-challenge/student_resource
+
+train_dir: /home/arjunshenoy13/Projects/Hackathons/amazon-ml-challenge/student_resource/dataset/train
+test_dir: /home/arjunshenoy13/Projects/Hackathons/amazon-ml-challenge/student_resource/dataset/test
+
+output_dir: /home/arjunshenoy13/Projects/Hackathons/amazon-ml-challenge/solution/outputs
