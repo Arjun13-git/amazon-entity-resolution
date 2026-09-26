@@ -7,7 +7,7 @@ cache/
 logs/
 
 outputs/*.tsv
-outputs/*.parquet
+outputs/parquet/
 outputs/*.json
 
 models/
