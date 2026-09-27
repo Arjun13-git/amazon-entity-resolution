@@ -1,9 +1,29 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
+
+
+# Environment variable that overrides the challenge dataset location.
+DATASET_ENV = "ER_DATASET_DIR"
+
+
+def dataset_dir() -> Path:
+    """
+    Challenge dataset directory (the one containing ``train/`` and ``test/``).
+
+    ``$ER_DATASET_DIR`` if set; otherwise ``<code root>/../student_resource/dataset``,
+    i.e. the dataset next to the repository / ``business_entity_resolution`` folder.
+    """
+
+    override = os.environ.get(DATASET_ENV)
+    if override:
+        return Path(override).expanduser().resolve()
+
+    return Path(__file__).resolve().parents[2].parent / "student_resource" / "dataset"
 
 
 EXPECTED_ENTITY_COLUMNS = [

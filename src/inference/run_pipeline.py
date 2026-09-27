@@ -34,6 +34,7 @@ from pathlib import Path
 
 from src.blocking import candidate_pipeline
 from src.blocking.candidate_pipeline import PipelineConfig, atomic_write_json, code_version
+from src.data.loader import dataset_dir
 from src.features import pairwise
 from src.inference import decide, predict_base, write_outputs
 from src.inference.predict_base import sha256_file
@@ -41,7 +42,7 @@ from src.inference.predict_base import sha256_file
 
 ROOT = Path(__file__).resolve().parents[2]
 STAGES = ["candidates", "validate", "features", "scores", "decisions", "submission"]
-DATASET_DIR = ROOT.parent / "student_resource" / "dataset"
+DATASET_DIR = dataset_dir()
 
 PACKAGES = ["numpy", "pandas", "pyarrow", "scipy", "scikit-learn", "xgboost", "rapidfuzz", "unidecode"]
 

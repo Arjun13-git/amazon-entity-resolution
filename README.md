@@ -370,6 +370,21 @@ The dataset is **not** in this repository and must not be committed. The code lo
 └── solution/        ← this repository (any folder name works, as long as it sits here)
 ```
 
+If the dataset is elsewhere — e.g. when running from the submission ZIP's
+`code/business_entity_resolution/` folder, where the default would be `code/student_resource/dataset` —
+point `ER_DATASET_DIR` at the directory containing `train/` and `test/` (the dataset is not packaged):
+
+```bash
+export ER_DATASET_DIR=/path/to/student_resource/dataset          # Linux / WSL2
+```
+
+```powershell
+$env:ER_DATASET_DIR = "C:\path\to\student_resource\dataset"   # PowerShell
+```
+
+`ER_DATASET_DIR` is read by `src.data.convert`, `src.blocking.entity_cache` and
+`src.inference.run_pipeline`; when unset, the layout above is used.
+
 ---
 
 ## Running Tests

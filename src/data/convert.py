@@ -4,14 +4,12 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.data.loader import dataset_dir
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
-DATASET_DIR = (
-    ROOT.parent
-    / "student_resource"
-    / "dataset"
-)
+DATASET_DIR = dataset_dir()
 
 OUTPUT_DIR = ROOT / "outputs" / "parquet"
 

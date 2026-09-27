@@ -21,7 +21,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from src.data.loader import load_ground_truth
+from src.data.loader import dataset_dir, load_ground_truth
 from src.preprocessing.normalize import (
     normalize_address,
     normalize_business_name,
@@ -34,13 +34,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PARQUET_DIR = ROOT / "outputs" / "parquet"
 CACHE_DIR = ROOT / "outputs" / "normalized"
 
-GROUND_TRUTH = (
-    ROOT.parent
-    / "student_resource"
-    / "dataset"
-    / "train"
-    / "train_ground_truth.tsv"
-)
+GROUND_TRUTH = dataset_dir() / "train" / "train_ground_truth.tsv"
 
 SOURCES = ("source1", "source2", "source3")
 
