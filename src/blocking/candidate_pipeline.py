@@ -91,6 +91,10 @@ class PipelineConfig:
     address_k: int = 25
     house_city_max_block: int = 1000
     lexicon_min_count: int = 25
+    # "train" or "test" entity cache.
+    dataset: str = "train"
+    # Directory with lexicon_<country>.txt to reuse (e.g. the training run).
+    lexicon_dir: str | None = None
     workers: int = 8
     chunk_work: int = 20_000_000
 
@@ -203,54 +207,127 @@ def peak_rss_mb() -> dict:
     }
 
 
-def run(cfg: PipelineConfig, out_dir: Path) -> dict:
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write via a temporary file + rename, so readers never see partial files."""
 
-    out_dir.mkdir(parents=True, exist_ok=False)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(path)
+
+
+def atomic_write_json(path: Path, obj) -> None:
+
+    atomic_write_bytes(path, json.dumps(obj, indent=2, default=float).encode())
+
+
+def atomic_write_parquet(table: pa.Table, path: Path) -> None:
+
+    tmp = path.with_name(path.name + ".tmp")
+    pq.write_table(table, tmp, compression="zstd")
+    tmp.replace(path)
+
+
+def load_or_build_lexicons(cfg: PipelineConfig, out_dir: Path, countries: list[str]) -> dict:
+    """
+    City lexicons per country, saved in the run directory.
+
+    Reused from the run directory on resume; otherwise copied from
+    ``cfg.lexicon_dir`` (e.g. the training run, so test features use the
+    same lexicons the model was trained with) or learned from the full S1
+    partition. Countries without a lexicon get an empty one (no city and
+    no house|city key).
+    """
+
+    lexicons, info = {}, {}
+
+    for country in countries:
+        path = out_dir / f"lexicon_{country}.txt"
+
+        if path.exists():
+            origin = "run directory (resume)"
+            words = frozenset(path.read_text().split())
+        elif cfg.lexicon_dir:
+            src = Path(cfg.lexicon_dir) / f"lexicon_{country}.txt"
+            origin = str(src) if src.exists() else f"none in {cfg.lexicon_dir} (empty)"
+            words = frozenset(src.read_text().split()) if src.exists() else frozenset()
+        else:
+            s1_all = load_partition("source1", country, ["norm_address"], cfg.dataset)
+            words = learn_city_lexicon(s1_all["norm_address"], country, min_count=cfg.lexicon_min_count)
+            origin = f"learned from {cfg.dataset} S1"
+            del s1_all
+
+        if not path.exists():
+            atomic_write_bytes(path, ("\n".join(sorted(words)) + "\n").encode())
+
+        lexicons[country] = words
+        info[country] = {
+            "file": path.name,
+            "size": len(words),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "origin": origin,
+        }
+
+    return lexicons, info
+
+
+def run(cfg: PipelineConfig, out_dir: Path, resume: bool = False) -> dict:
+    """
+    Generate candidates. Restartable: every part is written atomically with
+    a JSON sidecar; with ``resume`` an existing run directory (same config)
+    is continued and finished parts are skipped. A (target, country)
+    partition whose parts are all finished is not refitted.
+    """
+
     started = time.perf_counter()
 
-    s1_ids = sample_s1_ids(cfg.s1_sample, cfg.seed)
+    if out_dir.exists():
+        if not resume:
+            raise FileExistsError(f"{out_dir} exists (use resume to continue it)")
+        saved = json.loads((out_dir / "config.json").read_text())
+        if saved != json.loads(json.dumps(asdict(cfg))):
+            raise ValueError(f"config differs from the run being resumed: {saved}")
+    else:
+        out_dir.mkdir(parents=True)
+        atomic_write_json(out_dir / "config.json", asdict(cfg))
 
-    if s1_ids is not None:
-        pq.write_table(pa.table({"s1_id": s1_ids.astype(np.int32)}), out_dir / "s1_ids.parquet")
+    s1_ids = sample_s1_ids(cfg.s1_sample, cfg.seed, cfg.dataset)
 
-    manifest = {
-        "config": asdict(cfg),
-        "schema": SCHEMA.to_string(),
-        "source_bits": SOURCE_BITS,
-        "code": code_version(),
-        "lexicons": {},
-        "parts": [],
-    }
+    if s1_ids is not None and not (out_dir / "s1_ids.parquet").exists():
+        atomic_write_parquet(pa.table({"s1_id": s1_ids.astype(np.int32)}), out_dir / "s1_ids.parquet")
 
-    countries = list_countries("source1")
+    countries = list_countries("source1", cfg.dataset)
+    lexicons, lexicon_info = load_or_build_lexicons(cfg, out_dir, countries)
 
-    # City lexicons are learned from the FULL S1 partition, so they do
-    # not depend on the sample or the chunking.
-    lexicons = {}
-    for country in countries:
-        s1_all = load_partition("source1", country, ["norm_address"])
-        lexicons[country] = learn_city_lexicon(
-            s1_all["norm_address"], country, min_count=cfg.lexicon_min_count
-        )
-        path = out_dir / f"lexicon_{country}.txt"
-        path.write_text("\n".join(sorted(lexicons[country])) + "\n")
-        manifest["lexicons"][country] = {
-            "file": path.name,
-            "size": len(lexicons[country]),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-        }
-        del s1_all
+    fit_seconds = {}
+    part_records = []
 
     for target in cfg.targets:
         for country in countries:
-            queries_all = load_partition("source1", country, ["norm_name", "norm_address"])
+            queries_all = load_partition("source1", country, ["norm_name", "norm_address"], cfg.dataset)
             if s1_ids is not None:
                 queries_all = queries_all[
                     np.isin(queries_all["id"].to_numpy(), s1_ids)
                 ].reset_index(drop=True)
 
+            part_dir = out_dir / f"target={target}" / f"country={country}"
+            part_dir.mkdir(parents=True, exist_ok=True)
+
+            starts = list(range(0, len(queries_all), cfg.chunk_size))
+            pending = [
+                (part, start) for part, start in enumerate(starts)
+                if not (part_dir / f"part-{part:05d}.json").exists()
+            ]
+
+            for part in range(len(starts)):
+                if (part, starts[part]) not in pending:
+                    part_records.append(json.loads((part_dir / f"part-{part:05d}.json").read_text()))
+
+            if not pending:
+                print(f"[{target} | {country}] all {len(starts)} parts done; skipped", flush=True)
+                continue
+
             targets = load_partition(
-                TARGET_FILES[target], country, ["norm_name", "norm_address"]
+                TARGET_FILES[target], country, ["norm_name", "norm_address"], cfg.dataset
             )
             target_ids = targets["id"].to_numpy()
             stride = np.int64(len(targets) + 1)
@@ -260,19 +337,18 @@ def run(cfg: PipelineConfig, out_dir: Path) -> dict:
             for channel in channels.values():
                 channel.fit(targets)
             fit_time = time.perf_counter() - fit_start
+            fit_seconds[f"{target}/{country}"] = round(fit_time, 1)
 
             del targets
 
             print(
                 f"[{target} | {country}] S1={len(queries_all):,} "
-                f"targets={len(target_ids):,} fit {fit_time:.1f}s",
+                f"targets={len(target_ids):,} fit {fit_time:.1f}s; "
+                f"{len(pending)}/{len(starts)} parts to do",
                 flush=True,
             )
 
-            part_dir = out_dir / f"target={target}" / f"country={country}"
-            part_dir.mkdir(parents=True)
-
-            for part, start in enumerate(range(0, len(queries_all), cfg.chunk_size)):
+            for part, start in pending:
                 chunk_start = time.perf_counter()
                 queries = queries_all.iloc[start:start + cfg.chunk_size].reset_index(drop=True)
 
@@ -305,25 +381,28 @@ def run(cfg: PipelineConfig, out_dir: Path) -> dict:
                 )
 
                 path = part_dir / f"part-{part:05d}.parquet"
-                pq.write_table(table, path, compression="zstd")
+                atomic_write_parquet(table, path)
 
                 elapsed = time.perf_counter() - chunk_start
-                manifest["parts"].append(
-                    {
-                        "file": str(path.relative_to(out_dir)),
-                        "target": target,
-                        "country": country,
-                        "s1_rows": len(queries),
-                        "s1_id_min": int(queries["id"].min()),
-                        "s1_id_max": int(queries["id"].max()),
-                        "candidates": n,
-                        "per_channel": {
-                            name: int(len(keys)) for name, (keys, _, _) in per_channel.items()
-                        },
-                        "bytes": path.stat().st_size,
-                        "seconds": round(elapsed, 2),
-                    }
-                )
+                record = {
+                    "file": str(path.relative_to(out_dir)),
+                    "target": target,
+                    "country": country,
+                    "part": part,
+                    "s1_rows": len(queries),
+                    "s1_id_min": int(queries["id"].min()),
+                    "s1_id_max": int(queries["id"].max()),
+                    "candidates": n,
+                    "per_channel": {
+                        name: int(len(keys)) for name, (keys, _, _) in per_channel.items()
+                    },
+                    "bytes": path.stat().st_size,
+                    "seconds": round(elapsed, 2),
+                }
+                # The sidecar is written after the part: its presence means
+                # the part is complete.
+                atomic_write_json(part_dir / f"part-{part:05d}.json", record)
+                part_records.append(record)
 
                 print(
                     f"  part {part:05d}: S1 {len(queries):,} -> {n:,} candidates "
@@ -333,16 +412,26 @@ def run(cfg: PipelineConfig, out_dir: Path) -> dict:
 
                 del per_channel, merged, table
 
-            manifest.setdefault("fit_seconds", {})[f"{target}/{country}"] = round(fit_time, 1)
-
             del channels, queries_all
 
-    manifest["runtime_seconds"] = round(time.perf_counter() - started, 1)
-    manifest["peak_rss_mb"] = peak_rss_mb()
-    manifest["total_candidates"] = sum(p["candidates"] for p in manifest["parts"])
-    manifest["total_bytes"] = sum(p["bytes"] for p in manifest["parts"])
+    part_records.sort(key=lambda r: (r["target"], r["country"], r["part"]))
 
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    manifest = {
+        "config": asdict(cfg),
+        "schema": SCHEMA.to_string(),
+        "source_bits": SOURCE_BITS,
+        "code": code_version(),
+        "lexicons": lexicon_info,
+        "parts": part_records,
+        "fit_seconds": fit_seconds,
+        "resumed": resume,
+        "runtime_seconds": round(time.perf_counter() - started, 1),
+        "peak_rss_mb": peak_rss_mb(),
+        "total_candidates": sum(p["candidates"] for p in part_records),
+        "total_bytes": sum(p["bytes"] for p in part_records),
+    }
+
+    atomic_write_json(out_dir / "manifest.json", manifest)
 
     return manifest
 
@@ -375,6 +464,13 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--chunk-size", type=int, default=50_000)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--dataset", default="train", choices=["train", "test"])
+    parser.add_argument(
+        "--lexicon-dir",
+        default=None,
+        help="Reuse lexicon_<country>.txt from this directory (e.g. the training candidate run).",
+    )
+    parser.add_argument("--resume", action="store_true", help="Continue an interrupted run in --out.")
     args = parser.parse_args()
 
     cfg = PipelineConfig(
@@ -383,9 +479,11 @@ def main() -> None:
         seed=args.seed,
         chunk_size=args.chunk_size,
         workers=args.workers,
+        dataset=args.dataset,
+        lexicon_dir=args.lexicon_dir,
     )
 
-    manifest = run(cfg, args.out)
+    manifest = run(cfg, args.out, resume=args.resume)
 
     print(
         f"\nDone: {manifest['total_candidates']:,} candidates, "

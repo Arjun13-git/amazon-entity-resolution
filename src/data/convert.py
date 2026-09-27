@@ -17,9 +17,9 @@ OUTPUT_DIR = ROOT / "outputs" / "parquet"
 
 
 FILES = {
-    "train_source1": DATASET_DIR / "train" / "train_source1.tsv",
-    "train_source2": DATASET_DIR / "train" / "train_source2.tsv",
-    "train_source3": DATASET_DIR / "train" / "train_source3.tsv",
+    f"{split}_source{i}": DATASET_DIR / split / f"{split}_source{i}.tsv"
+    for split in ("train", "test")
+    for i in (1, 2, 3)
 }
 
 
@@ -52,12 +52,16 @@ def convert_file(
         exist_ok=True,
     )
 
+    # Write to a temporary file and rename, so an interrupted run never
+    # leaves a truncated Parquet file that a later run would [SKIP].
+    tmp = destination.with_suffix(".tmp")
     df.to_parquet(
-        destination,
+        tmp,
         engine="pyarrow",
         compression="zstd",
         index=False,
     )
+    tmp.replace(destination)
 
     print(
         f"[DONE] {name}: "
@@ -66,8 +70,15 @@ def convert_file(
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Convert challenge TSVs to Parquet.")
+    parser.add_argument("--datasets", nargs="+", default=["train"], choices=["train", "test"])
+    args = parser.parse_args()
+
     for name, source in FILES.items():
-        convert_file(name, source)
+        if name.split("_")[0] in args.datasets:
+            convert_file(name, source)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,8 @@ GROUND_TRUTH = (
 
 SOURCES = ("source1", "source2", "source3")
 
+DATASETS = ("train", "test")
+
 # Target source code used in the truth cache.
 TARGET_CODES = {"S2": 2, "S3": 3}
 
@@ -81,15 +83,18 @@ def _normalize_batch(batch: pa.RecordBatch) -> pa.Table:
     return pa.Table.from_pandas(out, schema=SCHEMA, preserve_index=False)
 
 
-def cache_path(source: str) -> Path:
+def cache_path(source: str, dataset: str = "train") -> Path:
 
-    return CACHE_DIR / f"train_{source}.parquet"
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset: {dataset}")
+
+    return CACHE_DIR / f"{dataset}_{source}.parquet"
 
 
-def build_source_cache(source: str, workers: int) -> None:
+def build_source_cache(source: str, workers: int, dataset: str = "train") -> None:
 
-    src = pq.ParquetFile(PARQUET_DIR / f"train_{source}.parquet")
-    dst = cache_path(source)
+    src = pq.ParquetFile(PARQUET_DIR / f"{dataset}_{source}.parquet")
+    dst = cache_path(source, dataset)
     tmp = dst.with_suffix(".tmp")
 
     with (
@@ -150,11 +155,12 @@ def load_partition(
     source: str,
     country: str,
     columns: list[str],
+    dataset: str = "train",
 ) -> pd.DataFrame:
     """Load one country's rows of a cached source, sorted by id."""
 
     table = pq.read_table(
-        cache_path(source),
+        cache_path(source, dataset),
         columns=["id", *columns],
         filters=[("country", "=", country)],
     )
@@ -166,9 +172,9 @@ def load_partition(
     )
 
 
-def list_countries(source: str) -> list[str]:
+def list_countries(source: str, dataset: str = "train") -> list[str]:
 
-    column = pq.read_table(cache_path(source), columns=["country"])["country"]
+    column = pq.read_table(cache_path(source, dataset), columns=["country"])["country"]
 
     return sorted(column.unique().to_pylist())
 
@@ -190,15 +196,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--datasets", nargs="+", default=["train"], choices=DATASETS)
     args = parser.parse_args()
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-    for source in SOURCES:
-        if args.force or not cache_path(source).exists():
-            build_source_cache(source, args.workers)
+    for dataset in args.datasets:
+        for source in SOURCES:
+            if args.force or not cache_path(source, dataset).exists():
+                build_source_cache(source, args.workers, dataset)
 
-    if args.force or not truth_path().exists():
+    # Ground truth exists for the training data only.
+    if "train" in args.datasets and (args.force or not truth_path().exists()):
         build_truth_cache()
 
 

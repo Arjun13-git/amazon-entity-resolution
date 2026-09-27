@@ -42,8 +42,8 @@ from src.blocking.entity_cache import load_partition, load_truth
 class PartitionLookup:
     """Sorted ids with name hashes and house|city key hashes."""
 
-    def __init__(self, source: str, country: str, lexicon: frozenset[str]):
-        df = load_partition(source, country, ["norm_name", "norm_address"])
+    def __init__(self, source: str, country: str, lexicon: frozenset[str], dataset: str = "train"):
+        df = load_partition(source, country, ["norm_name", "norm_address"], dataset)
 
         self.ids = df["id"].to_numpy()
         names = df["norm_name"].fillna("")
@@ -230,8 +230,9 @@ def main() -> None:
         if key != current:
             current = key
             target, country = key
-            s1 = PartitionLookup("source1", country, lexicons[country])
-            tg = PartitionLookup(TARGET_FILES[target], country, lexicons[country])
+            dataset = cfg.get("dataset", "train")
+            s1 = PartitionLookup("source1", country, lexicons[country], dataset)
+            tg = PartitionLookup(TARGET_FILES[target], country, lexicons[country], dataset)
             tg_sorted = {
                 "name": np.sort(tg.name_hash[~tg.name_empty]),
                 "key": np.sort(tg.key_hash[~tg.key_empty]),
@@ -310,7 +311,9 @@ def main() -> None:
             all_errors.append(f"not deterministic: {mismatched[:5]}")
 
     # Recall against ground truth.
-    if args.recall:
+    if args.recall and cfg.get("dataset", "train") != "train":
+        print("\n(recall skipped: no ground truth for this dataset)")
+    elif args.recall:
         print("\n=== RECALL (train ground truth) ===")
         for target in cfg["targets"]:
             truth = load_truth(target)

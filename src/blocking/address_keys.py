@@ -73,8 +73,21 @@ GENERIC = {
 DIGITS = re.compile(r"\d")
 
 
+# Postal-code length per supported country.
+POSTAL_LENGTH = {"us": 5, "india": 6}
+
+
+def is_supported(country: str) -> bool:
+    """Countries with a state table (city / house|city keys can be extracted)."""
+
+    return country in STATES
+
+
 def state_phrases(country: str) -> list[tuple[str, ...]]:
-    """All state names and codes as token tuples, longest first."""
+    """All state names and codes as token tuples, longest first ([] if unsupported)."""
+
+    if not is_supported(country):
+        return []
 
     table = STATES[country]
     phrases = {(code,) for code in table}
@@ -126,7 +139,15 @@ def learn_city_lexicon(
     country: str,
     min_count: int = 25,
 ) -> frozenset[str]:
-    """Tokens that frequently precede a *full* state name in ``addresses``."""
+    """
+    Tokens that frequently precede a *full* state name in ``addresses``.
+
+    Unsupported countries (no state table) get an empty lexicon, so no city
+    and no house|city key is extracted for them.
+    """
+
+    if not is_supported(country):
+        return frozenset()
 
     full_names = [
         tuple(name.split())
@@ -174,7 +195,11 @@ def extract_keys(
     """Per-address structured keys ('' = not extracted)."""
 
     phrases = state_phrases(country)
-    postal_len = 5 if country == "us" else 6
+    # Unsupported countries: house number is still extracted (the rule is
+    # country-independent); postal code, city and house|city stay empty.
+    postal_len = POSTAL_LENGTH.get(country)
+    if not is_supported(country):
+        lexicon = frozenset()
 
     house, postal, city = [], [], []
 
@@ -185,7 +210,7 @@ def extract_keys(
         p = ""
         for i in range(len(tokens) - 1, -1, -1):
             tok = tokens[i]
-            if i != h_idx and len(tok) == postal_len and tok.isdigit():
+            if postal_len and i != h_idx and len(tok) == postal_len and tok.isdigit():
                 p = tok
                 break
 

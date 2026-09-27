@@ -97,13 +97,13 @@ def settings_for(name: str, args: argparse.Namespace) -> list[int | None]:
     return sorted(args.k_values) if name in ("char", "address") else [None]
 
 
-def sample_s1_ids(sample: int | None, seed: int) -> np.ndarray | None:
+def sample_s1_ids(sample: int | None, seed: int, dataset: str = "train") -> np.ndarray | None:
 
     if not sample:
         return None
 
     ids = pq.read_table(
-        cache_path("source1"),
+        cache_path("source1", dataset),
         columns=["id"],
     )["id"].to_numpy()
 
