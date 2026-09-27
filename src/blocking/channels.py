@@ -492,6 +492,95 @@ class TransliteratedNameChannel(CharNgramChannel):
 # ----------------------------------------------------------------------
 
 
+class PostalCodeChannel(ExactNameChannel):
+    """
+    All targets sharing the query's postal code, for
+    queries whose block holds at most ``max_block`` targets.
+
+    Keys come from ``address_keys.extract_keys`` (postal column).
+    """
+
+    name = "postal_code"
+
+    def __init__(
+        self,
+        *,
+        country: str,
+        max_block: int = 1000,
+        chunk: int = 200_000,
+    ):
+        super().__init__(column="postal", chunk=chunk)
+
+        self.country = country
+        self.max_block = max_block
+
+    def _keys(self, df: pd.DataFrame) -> pd.DataFrame:
+
+        from src.blocking.address_keys import extract_keys
+
+        keys = extract_keys(df["norm_address"], self.country, frozenset())
+
+        return keys[["postal"]].reset_index(drop=True)
+
+    def fit(self, targets: pd.DataFrame) -> None:
+
+        super().fit(self._keys(targets))
+
+    def retrieve(self, queries: pd.DataFrame) -> Iterator[CandidateBatch]:
+
+        keys = self._keys(queries)
+        hashes = hash_strings(keys["postal"])
+
+        sizes = (
+            np.searchsorted(self.sorted_hashes, hashes, "right")
+            - np.searchsorted(self.sorted_hashes, hashes, "left")
+        )
+
+        keys.loc[sizes > self.max_block, "postal"] = ""
+
+        yield from super().retrieve(keys)
+
+
+class NameTokenSortChannel(ExactNameChannel):
+    """
+    All targets whose name tokens, sorted alphabetically, equal the
+    query's sorted name tokens. Catches word reordering like
+    "ABC Corp" vs "Corp ABC".
+    """
+
+    name = "name_token_sort"
+
+    def __init__(self, *, max_block: int = 1000, chunk: int = 200_000):
+        super().__init__(column="sorted_name", chunk=chunk)
+        self.max_block = max_block
+
+    def _sorted(self, names: pd.Series) -> pd.Series:
+        return names.fillna("").map(lambda n: " ".join(sorted(n.split())))
+
+    def fit(self, targets: pd.DataFrame) -> None:
+        sorted_names = self._sorted(targets["norm_name"])
+        hashes = hash_strings(sorted_names)
+        valid = (sorted_names != "").to_numpy()
+        order = np.argsort(hashes[valid], kind="stable")
+        self.sorted_hashes = hashes[valid][order]
+        self.sorted_rows = np.flatnonzero(valid)[order].astype(np.int32)
+
+    def retrieve(self, queries: pd.DataFrame) -> Iterator[CandidateBatch]:
+        sorted_names = self._sorted(queries["norm_name"])
+        hashes = hash_strings(sorted_names)
+
+        sizes = (
+            np.searchsorted(self.sorted_hashes, hashes, "right")
+            - np.searchsorted(self.sorted_hashes, hashes, "left")
+        )
+
+        sorted_names = sorted_names.copy()
+        sorted_names[sizes > self.max_block] = ""
+
+        df = pd.DataFrame({"sorted_name": sorted_names})
+        yield from super().retrieve(df)
+
+
 class HouseCityChannel(ExactNameChannel):
     """
     All targets sharing the query's ``house|city`` address key, for

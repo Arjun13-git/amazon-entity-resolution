@@ -82,6 +82,7 @@ class MatcherConfig:
         + [0.96, 0.97, 0.98, 0.99]
         + [round(t, 3) for t in np.arange(0.991, 0.9995, 0.001)]
         + [0.9995, 0.9999]
+        + [0.99991, 0.99993, 0.99995, 0.99997, 0.99999]
     )
     xgb_params: dict = field(
         default_factory=lambda: {
@@ -89,15 +90,15 @@ class MatcherConfig:
             "eval_metric": "aucpr",
             "tree_method": "hist",
             "device": "cpu",
-            "n_estimators": 1000,
-            "learning_rate": 0.1,
-            "max_depth": 6,
-            "min_child_weight": 5,
+            "n_estimators": 2000,
+            "learning_rate": 0.05,
+            "max_depth": 8,
+            "min_child_weight": 3,
             "subsample": 0.8,
             "colsample_bytree": 0.8,
             "reg_lambda": 1.0,
-            "max_bin": 256,
-            "early_stopping_rounds": 50,
+            "max_bin": 512,
+            "early_stopping_rounds": 100,
             "n_jobs": os.cpu_count(),
         }
     )

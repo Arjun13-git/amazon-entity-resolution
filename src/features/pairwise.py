@@ -138,6 +138,76 @@ def build_split(s1_ids: np.ndarray, validation_fraction: float, seed: int) -> pd
     return split.sort_values("s1_id").reset_index(drop=True)
 
 
+def prefilter(
+    candidates: pa.Table,
+    s1: EntityLookup,
+    tg: EntityLookup,
+) -> np.ndarray:
+    """
+    Fast pre-filter: drop obvious non-matches before the model sees them.
+
+    Keeps a candidate if ANY of:
+    - exact name match (normalized)
+    - name ratio >= 0.40 (catches typos, minor variations)
+    - house number match AND (address ratio >= 0.30 OR city match)
+    - address ratio >= 0.60 (strong address overlap)
+    - at least 2 matching numbers in address (strong signal)
+    - postal code match (exact)
+
+    Returns a boolean mask of candidates to KEEP.
+    """
+    s1_pos = s1.positions(candidates["s1_id"].to_numpy())
+    t_pos = tg.positions(candidates["target_id"].to_numpy())
+
+    s1_name = s1.name[s1_pos]
+    t_name = tg.name[t_pos]
+    s1_addr = s1.address[s1_pos]
+    t_addr = tg.address[t_pos]
+
+    n = len(s1_pos)
+    keep = np.zeros(n, dtype=bool)
+
+    # 1. Exact name match
+    keep |= (s1_name == t_name) & (s1_name != "")
+
+    # 2. Name ratio >= 0.40
+    from rapidfuzz.fuzz import ratio as fuzz_ratio
+    from rapidfuzz.process import cpdist
+    name_sim = cpdist(s1_name, t_name, scorer=fuzz_ratio, dtype=np.float32, workers=-1) / 100.0
+    keep |= name_sim >= 0.40
+
+    # 3. House number match + address/city signal
+    s1_derived = s1.derived(s1_pos, frozenset())
+    t_derived = tg.derived(t_pos, frozenset())
+    house_match = (s1_derived["house"] == t_derived["house"]) & (s1_derived["house"] != "")
+    addr_sim = cpdist(s1_addr, t_addr, scorer=fuzz_ratio, dtype=np.float32, workers=-1) / 100.0
+    city_match = (s1_derived["city"] == t_derived["city"]) & (s1_derived["city"] != "")
+    keep |= house_match & ((addr_sim >= 0.30) | city_match)
+
+    # 4. Address ratio >= 0.60
+    keep |= addr_sim >= 0.60
+
+    # 5. At least 2 matching numbers
+    s1_nums = s1_derived["numbers"]
+    t_nums = t_derived["numbers"]
+    for i in range(n):
+        if not keep[i] and s1_nums[i] and t_nums[i]:
+            if len(set(s1_nums[i]) & set(t_nums[i])) >= 2:
+                keep[i] = True
+
+    # 6. Postal code match
+    s1_postal = s1_derived["house_city"].str.split("|").str[0]  # not postal, use address_keys
+    # Actually use extract_keys for postal
+    from src.blocking.address_keys import extract_keys
+    import pandas as pd
+    s1_keys = extract_keys(pd.Series(s1_addr), "us", frozenset())
+    t_keys = extract_keys(pd.Series(t_addr), "us", frozenset())
+    postal_match = (s1_keys["postal"].to_numpy() == t_keys["postal"].to_numpy()) & (s1_keys["postal"].to_numpy() != "")
+    keep |= postal_match
+
+    return keep
+
+
 def part_features(
     candidates: pa.Table,
     s1: EntityLookup,
@@ -280,6 +350,14 @@ def run(
 
         part_start = time.perf_counter()
         candidates = pq.read_table(candidate_dir / meta["file"])
+
+        # Pre-filter: drop obvious non-matches before feature extraction
+        keep_mask = prefilter(candidates, s1, tg)
+        n_before = candidates.num_rows
+        candidates = candidates.filter(keep_mask)
+        n_after = candidates.num_rows
+        if n_before != n_after:
+            print(f"    prefilter: {n_before:,} -> {n_after:,} ({n_after/n_before:.1%} kept)", flush=True)
 
         features = part_features(candidates, s1, tg, lexicons[country])
 
