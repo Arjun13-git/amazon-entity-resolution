@@ -32,10 +32,19 @@ def retrieval_features(candidates: pa.Table) -> dict[str, np.ndarray]:
 
     name_rank = _rank(candidates["name_char_rank"].to_numpy())
     address_rank = _rank(candidates["address_char_rank"].to_numpy())
+    translit_rank = _rank(candidates["translit_name_rank"].to_numpy())
 
     # Best rank across a field's channels; exact / block hits count as rank 0.
-    best_name = np.where(hits["exact_name_hit"] == 1, 0.0, name_rank).astype(np.float32)
-    best_address = np.where(hits["house_city_hit"] == 1, 0.0, address_rank).astype(np.float32)
+    best_name = np.where(
+        (hits["exact_name_hit"] == 1) | (hits["name_token_sort_hit"] == 1),
+        0.0,
+        np.where(hits["translit_name_hit"] == 1, np.minimum(name_rank, translit_rank), name_rank),
+    ).astype(np.float32)
+    best_address = np.where(
+        (hits["house_city_hit"] == 1) | (hits["postal_code_hit"] == 1),
+        0.0,
+        address_rank,
+    ).astype(np.float32)
 
     # Candidates per S1 (every S1's candidates live in one part).
     s1 = candidates["s1_id"].to_numpy()
@@ -48,6 +57,8 @@ def retrieval_features(candidates: pa.Table) -> dict[str, np.ndarray]:
         "name_char_score": candidates["name_char_score"].to_numpy().astype(np.float32),
         "address_char_rank": address_rank,
         "address_char_score": candidates["address_char_score"].to_numpy().astype(np.float32),
+        "translit_name_rank": translit_rank,
+        "translit_name_score": candidates["translit_name_score"].to_numpy().astype(np.float32),
         "best_name_rank": best_name,
         "best_address_rank": best_address,
         "s1_candidate_count": counts[inverse].astype(np.int32),

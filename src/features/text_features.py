@@ -85,6 +85,25 @@ def exact_match(left: np.ndarray, right: np.ndarray) -> np.ndarray:
     return out
 
 
+STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "for", "in", "on", "at", "to",
+    "by", "with", "from", "as", "is", "was", "are", "were", "be", "been",
+    "being", "have", "has", "had", "do", "does", "did", "will", "would",
+    "could", "should", "may", "might", "can", "shall", "this", "that",
+    "these", "those", "it", "its", "he", "she", "they", "we", "you", "i",
+})
+
+
+def _token_sort_name(name: str) -> str:
+    """Sort tokens alphabetically."""
+    return " ".join(sorted(name.split()))
+
+
+def _remove_stopwords(name: str) -> str:
+    """Remove common stopwords from name."""
+    return " ".join(t for t in name.split() if t not in STOPWORDS)
+
+
 def name_features(
     s1_name: np.ndarray,
     t_name: np.ndarray,
@@ -94,6 +113,19 @@ def name_features(
 
     features = {"name_exact": exact_match(s1_name, t_name)}
     features.update(string_similarities(s1_name, t_name, "name"))
+
+    # Token-sort exact match (handles word reordering)
+    s1_sorted = np.array([_token_sort_name(n) for n in s1_name], dtype=object)
+    t_sorted = np.array([_token_sort_name(n) for n in t_name], dtype=object)
+    features["name_token_sort_exact"] = exact_match(s1_sorted, t_sorted)
+
+    # Stopword-removed similarity
+    s1_no_stop = np.array([_remove_stopwords(n) for n in s1_name], dtype=object)
+    t_no_stop = np.array([_remove_stopwords(n) for n in t_name], dtype=object)
+    features["name_no_stopwords_ratio"] = cpdist(
+        s1_no_stop, t_no_stop, scorer=fuzz.ratio, dtype=np.float32, workers=-1
+    ) / np.float32(100)
+    features["name_no_stopwords_ratio"][(s1_name == "") | (t_name == "")] = np.nan
 
     translit = string_similarities(
         s1_translit,

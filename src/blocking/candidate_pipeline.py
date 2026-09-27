@@ -46,6 +46,9 @@ from src.blocking.channels import (
     CharNgramChannel,
     ExactNameChannel,
     HouseCityChannel,
+    NameTokenSortChannel,
+    PostalCodeChannel,
+    TransliteratedNameChannel,
 )
 from src.blocking.entity_cache import list_countries, load_partition
 
@@ -56,6 +59,9 @@ SOURCE_BITS = {
     "name_char": 2,
     "address_char": 4,
     "house_city": 8,
+    "translit_name": 16,
+    "postal_code": 32,
+    "name_token_sort": 64,
 }
 
 TARGET_CODES = {"S2": 2, "S3": 3}
@@ -75,6 +81,10 @@ SCHEMA = pa.schema(
         ("address_char_rank", pa.int16()),
         ("address_char_score", pa.float32()),
         ("house_city_hit", pa.bool_()),
+        ("translit_name_rank", pa.int16()),
+        ("translit_name_score", pa.float32()),
+        ("postal_code_hit", pa.bool_()),
+        ("name_token_sort_hit", pa.bool_()),
     ]
 )
 
@@ -117,6 +127,14 @@ def build_channels(cfg: PipelineConfig, country: str, lexicon: frozenset[str]):
             lexicon=lexicon,
             max_block=cfg.house_city_max_block,
         ),
+        "translit_name": TransliteratedNameChannel(k=cfg.name_k, **common),
+        "postal_code": PostalCodeChannel(
+            country=country,
+            max_block=cfg.house_city_max_block,
+        ),
+        "name_token_sort": NameTokenSortChannel(
+            max_block=cfg.house_city_max_block,
+        ),
     }
 
 
@@ -141,7 +159,19 @@ def channel_candidates(channel, queries: pd.DataFrame, stride: np.int64):
 
 
 def merge_chunk(per_channel: dict, stride: np.int64) -> dict[str, np.ndarray]:
-    """Deduplicate (s1, target) keys across channels, keeping provenance."""
+    core_names = {"exact_name", "name_char", "address_char", "house_city"}
+    augment_names = {"postal_code", "name_token_sort", "translit_name"}
+
+    core_keys = np.concatenate([keys for name, (keys, _, _) in per_channel.items() if name in core_names])
+    core_unique = np.unique(core_keys)
+
+    # Filter augmentation channels: drop keys already in core
+    for name in augment_names:
+        if name in per_channel:
+            keys, rank, score = per_channel[name]
+            if len(keys) > 0:
+                is_new = np.isin(keys, core_unique, assume_unique=False, invert=True)
+                per_channel[name] = (keys[is_new], rank[is_new], score[is_new])
 
     all_keys = np.unique(np.concatenate([keys for keys, _, _ in per_channel.values()]))
     n = len(all_keys)
@@ -154,6 +184,8 @@ def merge_chunk(per_channel: dict, stride: np.int64) -> dict[str, np.ndarray]:
         "name_char_score": np.full(n, np.nan, np.float32),
         "address_char_rank": np.full(n, -1, np.int16),
         "address_char_score": np.full(n, np.nan, np.float32),
+        "translit_name_rank": np.full(n, -1, np.int16),
+        "translit_name_score": np.full(n, np.nan, np.float32),
     }
 
     for name, (keys, rank, score) in per_channel.items():
@@ -171,6 +203,9 @@ def merge_chunk(per_channel: dict, stride: np.int64) -> dict[str, np.ndarray]:
         elif name == "address_char":
             out["address_char_rank"][pos] = rank
             out["address_char_score"][pos] = score
+        elif name == "translit_name":
+            out["translit_name_rank"][pos] = rank
+            out["translit_name_score"][pos] = score
 
     return out
 
@@ -376,6 +411,10 @@ def run(cfg: PipelineConfig, out_dir: Path, resume: bool = False) -> dict:
                         "address_char_rank": merged["address_char_rank"],
                         "address_char_score": merged["address_char_score"],
                         "house_city_hit": (merged["mask"] & SOURCE_BITS["house_city"]) > 0,
+                        "translit_name_rank": merged["translit_name_rank"],
+                        "translit_name_score": merged["translit_name_score"],
+                        "postal_code_hit": (merged["mask"] & SOURCE_BITS["postal_code"]) > 0,
+                        "name_token_sort_hit": (merged["mask"] & SOURCE_BITS["name_token_sort"]) > 0,
                     },
                     schema=SCHEMA,
                 )
