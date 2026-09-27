@@ -1,643 +1,524 @@
-# Amazon ML Challenge 2026 — Business Entity Resolution
+# Amazon Business Entity Resolution
 
-This repository contains the solution pipeline for the **Amazon ML Challenge 2026
-Business Entity Resolution Challenge**: for every Source 1 (S1) business record,
-find all records in Source 2 (S2) and Source 3 (S3) that refer to the same
-real-world business, optimizing the challenge's per-S1 macro F0.5 metric.
-
-The pipeline is being built stage by stage. Everything up to and including
-pairwise feature extraction, labeling and the feature audit is implemented and
-validated on a 20,000-S1 training sample. **No matching model has been trained yet.**
+Solution pipeline for the **Amazon ML Challenge 2026 — Business Entity Resolution Challenge**:
+for every Source 1 (S1) business record, find all records in Source 2 (S2) and Source 3 (S3) that
+describe the same real-world business, optimizing per-S1 macro F0.5.
 
 ---
 
-## 1. Current pipeline status
+## Overview
 
-| Stage | Status |
-| --- | --- |
-| Data loading (TSV loaders, Parquet conversion) | ✅ Implemented |
-| Multilingual text normalization | ✅ Implemented |
-| Transliteration utility | ✅ Implemented |
-| Entity caching (normalized, integer-ID Parquet cache) | ✅ Implemented |
-| Candidate generation / blocking (streaming) | ✅ Implemented |
-| Candidate validation | ✅ Implemented |
-| Candidate recall benchmarking | ✅ Implemented |
-| Pairwise feature extraction | ✅ Implemented |
-| Ground-truth candidate labeling | ✅ Implemented |
-| Feature auditing | ✅ Implemented |
-| S1-level train/validation split | ✅ Implemented |
-| Macro F0.5 metric utility | ✅ Implemented (`src/evaluation/f05.py`) |
-| XGBoost matcher | ❌ Not implemented |
-| Decision / threshold optimization | ❌ Not implemented |
-| Final set-level matching logic | ❌ Not implemented |
-| Optional global conflict resolution | ❌ Not implemented |
-| Full-scale test inference | ❌ Not implemented |
-| Final submission packaging (`matching_results.tsv`, `candidate_pairs.tsv`) | ❌ Not implemented |
-
-### Known limitations of the current code
-
-- **Training data only.** `src/data/convert.py` and `src/blocking/entity_cache.py`
-  only process the `train_*` files. Nothing reads the test files yet.
-- **France is not supported yet.** The test set contains a third country, `France`,
-  that does not appear in training (see [Challenge overview](#2-challenge-overview)).
-  `src/blocking/address_keys.py` only has state tables for the US and India, so
-  `extract_keys` (used by the house-number + city channel and the structured
-  features) raises a `KeyError` for any other country. This must be generalized
-  before test inference.
-- The candidate pipeline has only been run on the 20,000-S1 benchmark sample, not
-  on the full 2.2M training S1 set.
-
----
-
-## 2. Challenge overview
-
-Facts below come from the challenge's `student_resource/README.md` and from
-measurements on the provided training data.
-
-### Sources
-
-Each source file has the columns `entity_id`, `business_name`, `business_address`,
-`country`. The ID prefix (`S1-`, `S2-`, `S3-`) identifies the source.
-
-- **S1** is the deduplicated reference source.
-- **S2** and **S3** are independent, noisy sources. Names may contain abbreviations,
-  legal suffixes, typos and transliterations. Addresses may be partial, reordered,
-  landmark-based or missing components.
-- An S1 entity may match **zero, one or many** S2/S3 records.
-
-| File | Records |
-| --- | --- |
-| `train_source1.tsv` | 2,206,821 |
-| `train_source2.tsv` | 5,034,616 |
-| `train_source3.tsv` | 5,285,603 |
-| `test_source1.tsv` | 1,732,544 |
-| `test_source2.tsv` | 4,887,273 |
-| `test_source3.tsv` | 5,082,316 |
-
-Training data covers `US` and `India`. The **test set also contains `France`**
-(259,452 test S1 records), which does not appear in training. The challenge asks
-that `country` be treated as an open set of labels.
-
-### Ground truth
-
-`train_ground_truth.tsv` has one row per S1 entity:
-
-| Column | Meaning |
-| --- | --- |
-| `source1_entity_id` | S1 entity ID |
-| `matched_entity_ids` | Comma-separated S2/S3 IDs; **empty when the S1 entity has no match** |
-
-Measured on the training data:
-
-- **7,638,365 true links**: 3,693,619 to S2 and 3,944,746 to S3.
-- **123,247 unmatched S1 entities (5.58%)**, which have an empty `matched_entity_ids`.
-- Matched S1 entities have 3.67 links on average (maximum 11).
-- **Distractor targets.** 1,340,997 S2 records (26.6%) and 1,340,857 S3 records
-  (25.4%) are not linked to any S1 entity. No S2/S3 record is linked to more than
-  one S1 entity.
-
-### Why all-pairs matching is infeasible
-
-Comparing every training S1 record with every S2 and S3 record would mean about
-2.2M × 10.3M ≈ 2.3 × 10¹³ pairs. Even within a single country (US: 1.32M S1 against
-about 6.2M S2+S3 records) it is about 8 × 10¹² pairs. Candidate generation (blocking)
-therefore has to reduce this to a few hundred candidates per S1 while keeping
-almost all true matches.
-
-### Evaluation metric
-
-F0.5 is computed **per S1 entity**, then macro-averaged over **all** S1 entities:
+The system is a blocking + learned-matcher pipeline:
 
 ```
-F0.5 = (1.25 × Precision × Recall) / (0.25 × Precision + Recall)
+Challenge TSVs
+  → normalization (Unicode-safe, multilingual)
+  → integer-ID entity caches (Parquet)
+  → candidate blocking (4 retrieval channels, streamed in chunks)
+  → pairwise feature extraction (35 model features)
+  → XGBoost pairwise matcher
+  → S1-level contextual second-stage decision model
+  → matching_results.tsv + candidate_pairs.tsv
+  → challenge submission validator
 ```
 
-- F0.5 weights precision more than recall, so false merges cost more than missed links.
-- An S1 entity with no true match scores **1.0** for an empty prediction and **0.0**
-  for any non-empty prediction. Correctly predicting "no match" matters, and false
-  merges on unmatched S1 entities are penalized.
-- Candidate generation sets the upper bound on recall: a true link that is not a
-  candidate can never be predicted.
+Results measured on a 20,000-S1 training sample (validation = 4,000 held-out S1; see
+[Current Status](#current-status)):
 
-`src/evaluation/f05.py` implements `fbeta`, `set_f05` (per-S1 F0.5) and `macro_f05`
-with these rules.
+| Stage | Result |
+|---|---|
+| Candidate recall (final union), S2 / S3 | 97.35% / 97.04% |
+| Base XGBoost matcher (`xgb_skeleton`), validation macro F0.5 | 0.9181 |
+| + S1-level contextual decision layer, validation macro F0.5 | **0.9254** |
+
+The production inference pipeline for the full test set is implemented, tested and restartable,
+but **has not yet been run on the complete test dataset**.
 
 ---
 
-## 3. Repository structure
+## Challenge
+
+Facts from the challenge's `student_resource/README.md` and from measurements on the provided data.
+
+- Each source file has `entity_id`, `business_name`, `business_address`, `country`. The ID prefix
+  (`S1-`, `S2-`, `S3-`) gives the source. **S1 is the deduplicated reference**; an S1 entity may
+  match zero, one or many S2/S3 records.
+- Countries: training covers **US** and **India**; the test set additionally contains **France**.
+
+| File | Records | | File | Records |
+|---|---|---|---|---|
+| `train_source1.tsv` | 2,206,821 | | `test_source1.tsv` | 1,732,544 (India 809,986 · US 663,106 · France 259,452) |
+| `train_source2.tsv` | 5,034,616 | | `test_source2.tsv` | 4,887,273 |
+| `train_source3.tsv` | 5,285,603 | | `test_source3.tsv` | 5,082,316 |
+
+- `train_ground_truth.tsv`: one row per S1 with comma-separated matched S2/S3 IDs (empty = no match).
+  7,638,365 true links (S2 3,693,619 · S3 3,944,746); 123,247 S1 (5.58%) have no match; about 26%
+  of S2/S3 records are never linked to any S1 (distractors); no S2/S3 record is linked to more than
+  one S1.
+- **Metric:** F0.5 per S1, macro-averaged over **all** S1 (an S1 with no true match scores 1.0 for an
+  empty prediction and 0.0 otherwise). F0.5 weights precision over recall, so false merges are costly.
+- **Why blocking:** all S1×(S2+S3) training pairs would be ≈ 2.2M × 10.3M ≈ 2.3 × 10¹³ comparisons;
+  blocking reduces this to a few hundred candidates per S1.
+
+---
+
+## Architecture
+
+| Stage | Module(s) | Purpose |
+|---|---|---|
+| Data processing | `src/data/convert.py`, `src/data/loader.py` | TSV → Parquet; safe string-typed loading |
+| Normalization | `src/preprocessing/normalize.py`, `transliterate.py` | Unicode-safe name/address/country normalization; Latin transliteration |
+| Entity caches | `src/blocking/entity_cache.py` | normalized, integer-ID Parquet per source and dataset (+ training ground truth) |
+| Candidate blocking | `src/blocking/channels.py`, `address_keys.py`, `candidate_pipeline.py` | 4 retrieval channels per (target source, country); streamed S1 chunks |
+| Candidate validation | `src/blocking/validate_candidates.py` | duplicates, country, provenance, completeness, determinism |
+| Pairwise features | `src/features/pairwise.py` (+ `text_`, `address_`, `retrieval_features.py`) | 40 feature columns per candidate; labels on training data only |
+| Base matcher | `src/models/xgb_matcher.py` | XGBoost pairwise classifier (training + evaluation) |
+| Decision layer | `src/decision/oof.py`, `src/decision/s1_context.py` | out-of-fold base scores + S1-context second stage |
+| Inference | `src/inference/*.py` | restartable test pipeline: scoring, decisions, output files |
+
+---
+
+## Repository Structure
 
 ```text
 solution/
 ├── README.md
-├── requirements.txt           # pinned dependencies
-├── .gitignore
-├── configs/
-│   └── paths.yaml             # not read by any code (see note below)
-├── experiments/
-│   └── experiment_log.csv     # header only; no experiments logged yet
-└── src/
-    ├── data/
-    │   ├── loader.py          # safe TSV / ground-truth loaders (+ small inspection CLI)
-    │   └── convert.py         # train TSV -> Parquet conversion
-    ├── preprocessing/
-    │   ├── normalize.py       # Unicode-safe name / address / country normalization
-    │   └── transliterate.py   # Latin-script transliteration (unidecode)
-    ├── blocking/
-    │   ├── entity_cache.py        # normalized integer-ID cache + ground-truth cache
-    │   ├── channels.py            # retrieval channels (exact, char n-gram, address, house+city)
-    │   ├── address_keys.py        # house number / postal / city key extraction
-    │   ├── candidate_pipeline.py  # FINAL streaming candidate generation
-    │   ├── validate_candidates.py # candidate-set validation
-    │   ├── benchmark_candidates.py        # per-channel recall benchmark (+ memory estimates)
-    │   ├── diagnose_union.py              # exact ∪ char overlap / miss diagnosis, rerank variants
-    │   ├── benchmark_address_union.py     # address channel benchmark
-    │   ├── benchmark_translit_union.py    # transliterated-name channel benchmark (not adopted)
-    │   ├── benchmark_structured_union.py  # structured address-key benchmark
-    │   ├── profile_true_matches.py        # similarity profile of true S1->S2/S3 links
-    │   ├── inspect_zero_name_matches.py   # inspection of zero-name-similarity true links
-    │   └── exact_name.py, token_index.py, char_tfidf.py,
-    │       benchmark_exact_name.py, benchmark_token_blocking.py,
-    │       benchmark_char_tfidf.py, test_exact_name.py
-    │                                      # early dict-based prototypes (superseded)
-    ├── features/
-    │   ├── text_features.py       # name similarity features
-    │   ├── address_features.py    # address similarity + structured-key features
-    │   ├── retrieval_features.py  # candidate-provenance features
-    │   ├── pairwise.py            # streaming feature extraction + labeling driver
-    │   └── audit_features.py      # feature / label audit
-    ├── evaluation/
-    │   ├── f05.py             # per-S1 and macro F0.5
-    │   ├── split.py           # S1-level train/validation split
-    │   └── labels.py          # candidate labeling against ground truth
-    ├── decision/              # empty package (placeholder)
-    └── inference/             # empty package (placeholder)
+├── requirements.txt            pinned dependencies
+├── configs/paths.yaml          not read by any code (paths are resolved relative to the repo)
+├── experiments/experiment_log.csv
+├── src/
+│   ├── data/                   loader.py, convert.py
+│   ├── preprocessing/          normalize.py, transliterate.py
+│   ├── blocking/
+│   │   ├── entity_cache.py  address_keys.py  channels.py
+│   │   ├── candidate_pipeline.py            production candidate generation
+│   │   ├── validate_candidates.py           candidate validation
+│   │   ├── benchmark_*.py  diagnose_union.py  profile_true_matches.py
+│   │   │   inspect_zero_name_matches.py     research / benchmarks
+│   │   └── exact_name.py  token_index.py  char_tfidf.py  test_exact_name.py
+│   │                                        early prototypes (superseded)
+│   ├── features/               text_features.py, address_features.py, retrieval_features.py,
+│   │                           pairwise.py (production); audit_features.py (diagnostic)
+│   ├── evaluation/             f05.py, split.py, labels.py (used in training/evaluation);
+│   │                           error_analysis.py, name_miss_analysis.py,
+│   │                           fp_skeleton_analysis.py (diagnostic)
+│   ├── models/                 xgb_matcher.py
+│   ├── decision/               oof.py, s1_context.py
+│   └── inference/              run_pipeline.py, predict_base.py, decide.py, write_outputs.py
+└── tests/                      unittest suite
 ```
 
-Notes:
+Everything under `outputs/` (Parquet caches, candidates, features, trained models, experiment and
+production runs) is **git-ignored and must be regenerated** — see
+[Reproducing the model artifacts](#reproducing-the-model-artifacts).
 
-- `src/decision/` and `src/inference/` only contain an empty `__init__.py`.
-- There is no `src/models/` directory in the repository.
-- `configs/paths.yaml` is not read by any code. Paths are resolved relative to the
-  repository (see [Dataset setup](#5-dataset-setup)).
-- Generated data goes to `outputs/`, which git ignores.
-
-### Blocking channels (final design)
-
-Candidate generation runs **per target source (S2, S3) and per country partition**,
-and combines four channels (`src/blocking/channels.py`):
-
-| Channel | What it does | Final setting |
-| --- | --- | --- |
-| `exact_name` | All targets whose normalized business name equals the S1 name. Uses sorted hash arrays + `searchsorted`, not a Python dict. | all matches |
-| `name_char` | Character-trigram TF-IDF over normalized names. Uses hashed features (no vocabulary dict) with IDF computed from the targets. Trigrams appearing in more than 30,000 target names are left out of the sparse index. The top 1,000 targets by pruned score are **reranked by full cosine similarity** (all trigrams). | rerank pool = 1000, final K = **100** |
-| `address_char` | The same machinery over normalized addresses. | rerank pool = 1000, final K = **25** |
-| `house_city` | Exact match on an extracted `house number | city` address key, kept only when the key's block holds at most 1,000 targets. | block cap = **1000** |
-
-The channels' candidates are **unioned and deduplicated** on the integer pair
-(S1 ID, target ID). The output keeps which channels retrieved each pair, plus
-each channel's rank and score. This candidate set is the input to the (future)
-matcher.
-
-Channels that were benchmarked and **not** adopted:
-
-- **Transliterated-name retrieval** (`TransliteratedNameChannel`): about +0.2–0.3 recall points.
-- **Postal-code blocking**: postal codes are almost never present in the data.
+**Production vs. research code.** The production path is: `data` → `preprocessing` →
+`entity_cache` → `address_keys` + `channels` + `candidate_pipeline` → `validate_candidates` →
+`features/{text,address,retrieval}_features` + `pairwise` → `models/xgb_matcher` (training) →
+`decision/{oof,s1_context}` (second-stage training; `context_features`/`design` reused at inference)
+→ `inference/*`. The `benchmark_*`, `diagnose_union`, `profile_*`, `inspect_*`, `audit_features` and
+`evaluation/*_analysis.py` modules are research and diagnostic tools that informed design decisions;
+they are not part of the production run. `channels.py` also contains a `TransliteratedNameChannel`
+that was benchmarked and **not** adopted.
 
 ---
 
-## 4. Environment / setup
+## Methodology
 
-### Requirements
+### Data Processing
 
-- Linux (development and all measurements were done on Linux x86-64).
-- **Python 3.12.**
-- [uv](https://docs.astral.sh/uv/) for the virtual environment. The repository has
-  **no `pyproject.toml` or `uv.lock`**; dependencies are pinned in `requirements.txt`.
-- **No GPU or CUDA is required** for anything implemented so far. `requirements.txt`
-  includes `nvidia-nccl-cu13` only because it is pinned as a dependency of the
-  `xgboost` Linux wheel.
+- `src/data/loader.py`: reads TSVs with `sep="\t"`, all columns as strings, `keep_default_na=False`
+  (empty stays empty); validates headers.
+- `src/data/convert.py`: `train_*`/`test_*` TSV → zstd Parquet in `outputs/parquet/` (atomic writes;
+  existing files skipped).
+- `src/blocking/entity_cache.py`: normalizes every record once and writes
+  `outputs/normalized/{train,test}_source{1,2,3}.parquet` (`id` int32, `country`, `norm_name`,
+  `norm_address`) and `train_truth.parquet`. All IDs in every file are integers < 2³¹, so the
+  integer representation is lossless.
 
-### Fresh clone
+### Normalization
 
-The code finds the dataset at `../student_resource/dataset` relative to the
-repository root, so clone the repository **next to** the challenge's
-`student_resource/` directory:
+- NFKC + lowercase; Unicode letters, digits and combining marks are kept in every script
+  (Devanagari, Tamil, Kannada, … stay intact); punctuation/symbols become spaces.
+- Business names: Latin-script legal prefixes/suffixes removed (`inc`, `llc`, `ltd`, `pvt`,
+  `private`, `limited`, `gmbh`, …).
+- `transliterate_text`: `unidecode`-based Latin transliteration, used for transliterated name features.
+
+### Candidate Generation
+
+Blocking runs per target source (S2, S3) and country partition. Settings are the
+`PipelineConfig` defaults in `src/blocking/candidate_pipeline.py`:
+
+| Channel | Method | Setting |
+|---|---|---|
+| `exact_name` | all targets with the identical normalized name (sorted hash array + `searchsorted`) | all matches |
+| `name_char` | character-trigram TF-IDF (`char_wb` (3,3), hashed to 2²² features, no vocabulary dict); trigrams in > 30,000 target names are left out of the sparse index; top 1,000 by pruned score are **reranked by full cosine** | rerank pool 1,000, final K = **100** |
+| `address_char` | same machinery on normalized addresses | rerank pool 1,000, final K = **25** |
+| `house_city` | exact match on the extracted `house number | city` key | blocks ≤ **1,000** targets |
+
+Channel outputs are unioned and deduplicated per (S1, target); every candidate keeps its channel
+bitmask, per-channel ranks and scores. S1 are processed in chunks (sorted by id); each chunk is one
+Parquet part, so the candidate set is never held in memory.
+
+**Country-aware behavior** (`src/blocking/address_keys.py`): city and house+city keys need a state
+table and a city lexicon, which exist for US and India only. For any other country (France in the
+test set) the house number is still extracted (the rule is country-independent) but city, postal
+code and house+city are empty — the `house_city` channel contributes no candidates and
+`city_match`/`house_city_match` are NaN. The exact-name, name and address channels work for every
+country. City lexicons are learned from training S1 and reused for test (`--lexicon-dir`).
+
+Measured candidate recall (training ground truth; 20k random training S1, complete S2/S3 populations):
+
+| Configuration | S2 recall | S3 recall | Scope |
+|---|---|---|---|
+| Exact normalized name | 41.49% | 40.11% | all 2.2M training S1 |
+| Name char, rerank 1000 → top 100 | 71.35% | 70.10% | 20k-S1 sample |
+| Exact ∪ name char ∪ address char (K=25) | 96.61% | 96.02% | 20k-S1 sample |
+| **+ house+city (final union)** | **97.35%** | **97.04%** | 20k-S1 sample, ~173 candidates/S1 |
+
+`validate_candidates` checks: no duplicate pairs; S1/targets in the part's country; channel
+provenance; exact-name and house+city correctness and completeness; rank/score sanity; per-S1
+counts; streaming iteration; and (with `--compare`) identical content across runs.
+
+### Pairwise Features
+
+`src/features/pairwise.py` streams candidate parts and writes one feature part per candidate part.
+Transliteration, skeletons, address keys and name frequencies are computed once per entity.
+
+| Family | Features |
+|---|---|
+| Name | exact, RapidFuzz ratio / partial / token-sort / token-set, token Jaccard, transliterated ratio and token Jaccard |
+| Transliteration skeleton | `translit_skeleton_ratio`: transliterated name with Latin and transliterated legal suffixes removed (`praaivett`, `limittedd`, …), phonetic digraphs merged, vowels dropped, repeated letters collapsed; NaN for skeletons shorter than 2 letters |
+| Name rarity | `target_name_frequency` (targets sharing the normalized name within its source and country; computed from the entity population, no labels), `target_name_rarity` = 1 / frequency |
+| Address | ratio, partial, token-sort, token-set, token Jaccard |
+| Address numbers | number-set Jaccard, ordered number-sequence similarity, numeric-token count difference, secondary-number match (all digit runs, not just the first) |
+| Structured | house-number match, city match, house+city match, country match |
+| Retrieval | channel hits, number of channels, name/address channel rank and score, best ranks, candidates per S1 |
+| Missingness | S1/target name and address missing flags |
+
+Similarities are NaN when either side is empty, so "unknown" is never treated as "dissimilar".
+Labels (`src/evaluation/labels.py`) are built only on training data, per target source (S2
+candidates are never labeled from S3 truth); on test data `label` and `split` are written as −1.
+
+### XGBoost Matcher
+
+`src/models/xgb_matcher.py` (experiment `xgb_skeleton`):
+
+- **35 input features** — the 40 feature columns minus `country_match`, `s1_name_missing`,
+  `s1_address_missing` (constant) and `name_exact`, `house_city_match` (duplicates).
+- S1-level split (`src/evaluation/split.py`): 16,000 train / 4,000 validation S1, seed 42; early
+  stopping on a further 10% S1 hold-out carved from the train split.
+- `hist` trees, learning rate 0.1, depth 6, min child weight 5, subsample / colsample 0.8,
+  up to 1,000 trees with early stopping (50 rounds, AUC-PR), `scale_pos_weight` = negatives /
+  positives of the fitted rows (≈ 103), CPU only, seed 42.
+- Evaluated with the challenge metric (per-S1 macro F0.5 over all validation S1, including
+  blocking misses); threshold swept on validation.
+
+Feature additions were accepted one at a time on the same split (validation macro F0.5):
+
+| Experiment | Features | Macro F0.5 | Threshold |
+|---|---|---|---|
+| `xgb_baseline` | 28 | 0.8857 | 0.994 |
+| `xgb_numeric` (+ address numbers) | 32 | 0.9081 | 0.994 |
+| `xgb_rarity` (+ name rarity) | 34 | 0.9135 | 0.993 |
+| `xgb_skeleton` (+ transliteration skeleton) | 35 | 0.9181 | 0.991 |
+
+### S1-Level Decision Layer
+
+A second model re-decides candidates using the context of **all candidates of the same S1**
+(`src/decision/s1_context.py`; used by `src/inference/decide.py`):
+
+- **Context features** (no labels): S1 candidate count; counts above score levels; candidate rank
+  and percentile; S1 top and second score; gap to the top score; high-score counts per target source;
+  whether the top candidate is S3; the candidate's difference to the S1's top candidate in address
+  token-set, name ratio, number-set Jaccard, skeleton ratio and name frequency; plus the candidate's
+  own name frequency, missing-address flag and address-contradiction flag. The production model uses
+  22 such inputs.
+- **Training without leakage** (`src/decision/oof.py`): 5-fold S1-grouped **out-of-fold** base scores
+  on the training S1 (same base configuration per fold). The second-stage model type (logistic
+  regression vs. small XGBoost) and its threshold are selected on train OOF; validation is scored once.
+- **Production model:** XGBoost, 300 trees, depth 3, learning rate 0.05. Only candidates with base
+  score ≥ **0.5** are re-decided; a candidate is matched when the second-stage probability ≥ **0.65**.
+- Validation: macro F0.5 0.9181 → **0.9254**; false positives 416 → 369; false negatives 1,516 → 1,385;
+  no-match S1 receiving a prediction 34 → 18.
+
+### Inference Pipeline
+
+`src/inference/run_pipeline.py` runs, in order:
+
+1. **candidates** — `candidate_pipeline` on the test caches, reusing the training lexicons
+2. **validate** — `validate_candidates` (read-only checks)
+3. **features** — `pairwise` (no labels)
+4. **scores** — `predict_base`: `xgb_skeleton` probability per candidate
+5. **decisions** — `decide`: S1 context + second stage
+6. **submission** — `write_outputs`: the two challenge TSVs
+
+S1 context needs every candidate of an S1 from both S2 and S3. Each country's S1 list is chunked
+identically for both targets, so candidate part *k* of S2 and of S3 cover the same S1; `decide`
+processes each (country, *k*) pair as one group and refuses to run unless both report the same S1
+range and count and groups do not overlap. Context is never computed on a partial group.
+
+**Restartable:** every part is written atomically (temporary file + rename) followed by a JSON
+sidecar; re-running the same command skips finished parts, and a candidate partition whose parts are
+all done is not refitted. Resuming with a different configuration is refused.
+
+---
+
+## Setup
+
+Requirements: **Python 3.12**, [uv](https://docs.astral.sh/uv/), the challenge dataset. No GPU or
+CUDA is used. The repository has no `pyproject.toml`/`uv.lock`; dependencies are pinned in
+`requirements.txt` (so use `uv pip install -r requirements.txt`, not `uv sync`).
+
+Resources (measured on 16 cores / 23 GB RAM): candidate generation peaks at ~5 GB RAM with 8 worker
+processes; ≥ 16 GB RAM recommended.
+
+After setup, a fresh clone still has no model artifacts (`outputs/` is git-ignored) — see
+[Reproducing the model artifacts](#reproducing-the-model-artifacts) before running inference.
+
+### Linux
 
 ```bash
-cd <challenge-workspace>          # the directory that contains student_resource/
+# uv (skip if installed)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Clone NEXT TO the challenge's student_resource/ directory (see Dataset Layout)
+cd <challenge-workspace>
 git clone https://github.com/Arjun13-git/amazon-entity-resolution.git solution
 cd solution
 
-uv venv --python 3.12 .venv       # uv downloads Python 3.12 if it is not installed
+uv venv --python 3.12 .venv        # uv downloads Python 3.12 if needed
 source .venv/bin/activate
 uv pip install -r requirements.txt
+
+python -c "import xgboost, rapidfuzz, pyarrow; print('ok', xgboost.__version__)"
 ```
 
-Run every command in this README from the repository root with the environment
-activated. All entry points are Python modules (`python -m src....`).
+Run every command below from the repository root with the environment active.
 
-### Resource considerations
+### Windows
 
-These are measured on the development machine (16 CPU cores, 23 GB RAM):
+> **Windows support**
+>
+> - **Native Windows is suitable for:** repository setup, the unit tests, and submission validation.
+> - **Run under WSL2 (Ubuntu), following the Linux guide:** entity-cache building, full candidate
+>   generation and production inference (`run_pipeline`). Reasons:
+>   - `src/blocking/entity_cache.py` and `src/blocking/channels.py` use fork-based multiprocessing
+>     (`multiprocessing.get_context("fork")`), which does not exist on Windows;
+>   - `requirements.txt` pins `nvidia-nccl-cu13`, a Linux-only wheel (excluded in step 7 below).
 
-- The streaming candidate pipeline peaked at about **5.1 GB RSS** in the parent
-  process on the 20,000-S1 sample. It holds fitted country-partition indexes of up
-  to 3.2M targets.
-- The char-channel worker processes (default 8, forked) share the index
-  copy-on-write. The largest worker reported about 3.1 GB RSS, which includes
-  shared pages.
-- **16 GB of RAM or more is recommended.** Lower `--workers` to reduce memory.
-- The CPU is the bottleneck: the char channels use one process per worker.
-- Disk use for the 20k-sample run: normalized cache about 770 MB, candidates about
-  60 MB, features about 155 MB.
+PowerShell (Windows 10/11):
+
+```powershell
+# 1. Git
+winget install --id Git.Git -e
+
+# 2-3. uv, then Python 3.12 through uv
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+uv python install 3.12
+
+# 4-5. Clone next to student_resource\ and enter it
+cd <challenge-workspace>
+git clone https://github.com/Arjun13-git/amazon-entity-resolution.git solution
+cd solution
+
+# 6. Virtual environment
+uv venv --python 3.12 .venv
+.\.venv\Scripts\Activate.ps1      # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+
+# 7. Dependencies (without the Linux-only nvidia-nccl-cu13 wheel)
+Get-Content requirements.txt | Where-Object { $_ -notmatch '^nvidia-nccl' } |
+    Set-Content "$env:TEMP\requirements-windows.txt"
+uv pip install -r "$env:TEMP\requirements-windows.txt"
+
+# 8. Place the dataset (see Dataset Layout)
+
+# 9. Verify
+python -c "import xgboost, rapidfuzz, pyarrow; print('ok', xgboost.__version__)"
+
+# 10. Tests
+python -m unittest discover -s tests -v
+```
+
+11–12. Production inference: use WSL2 (`wsl --install -d Ubuntu`, then the Linux guide; keep the
+repository and dataset inside the WSL file system for speed). The validator runs natively:
+
+```powershell
+cd ..\student_resource
+python utils\validate_submission.py `
+    --matching ..\solution\outputs\production\test_v1\submission\output\matching_results.tsv `
+    --candidate ..\solution\outputs\production\test_v1\submission\output\candidate_pairs.tsv `
+    --test-dir dataset\test
+```
 
 ---
 
-## 5. Dataset setup
+## Dataset Layout
 
-The challenge dataset is **not** part of this repository and **must not be
-committed**. Obtain it from the challenge separately and place it like this:
+The dataset is **not** in this repository and must not be committed. The code locates it at
+`../student_resource/dataset` relative to the repository root:
 
 ```text
 <challenge-workspace>/
 ├── student_resource/
-│   └── dataset/
-│       ├── train/
-│       │   ├── train_source1.tsv
-│       │   ├── train_source2.tsv
-│       │   ├── train_source3.tsv
-│       │   └── train_ground_truth.tsv
-│       └── test/
-│           ├── test_source1.tsv
-│           ├── test_source2.tsv
-│           └── test_source3.tsv
-└── solution/                     # this repository
-```
-
-All files are **tab-separated** and must be read with `sep="\t"`. Addresses and ID
-lists contain commas. The repository loaders read every column as a string with
-`keep_default_na=False`, so empty values stay empty strings rather than NaN.
-
----
-
-## 6. Data preprocessing
-
-### TSV loading — `src/data/loader.py`
-
-- `load_entities(path, usecols=None, nrows=None)` validates the column names and
-  reads all values as strings.
-- `load_ground_truth(path, nrows=None)` validates the ground-truth header.
-
-A small inspection CLI is included:
-
-```bash
-python -m src.data.loader ../student_resource/dataset/train/train_source1.tsv --nrows 1000
-python -m src.data.loader ../student_resource/dataset/train/train_ground_truth.tsv --ground-truth
-```
-
-### Parquet conversion — `src/data/convert.py`
-
-This converts the three **training** source TSVs to zstd-compressed Parquet in
-`outputs/parquet/`. Existing files are skipped.
-
-```bash
-python -m src.data.convert
-```
-
-### Normalization — `src/preprocessing/normalize.py`
-
-- **Unicode-safe.** NFKC normalization and lowercasing. Unicode letters, digits and
-  combining marks are kept in every script; punctuation and symbols become spaces;
-  whitespace is collapsed. Names in Devanagari, Telugu, Kannada, Tamil, Bengali and
-  other scripts therefore stay intact instead of being stripped to ASCII. Stripping
-  to ASCII would erase them (about 23% of Indian S2 names are non-Latin).
-- **Business names.** Common legal suffixes and prefixes (`inc`, `llc`, `ltd`,
-  `pvt`, `private`, `limited`, `gmbh`, `sarl`, …) are removed from the start and end
-  of the token sequence. The list is Latin-script only, so non-Latin suffixes such
-  as `प्राइवेट लिमिटेड` are not removed.
-- **Addresses and countries.** The same text normalization is applied, without
-  suffix removal.
-
-### Transliteration — `src/preprocessing/transliterate.py`
-
-`transliterate_text` maps text to Latin script with `unidecode`. It is used for the
-transliterated-name features. As a retrieval channel it was benchmarked and not
-adopted: phonetic transliteration of Indic-script names (for example
-`फ्यूचर लोटस` → `phyuucr lotts`) rarely matches the English spelling.
-
-### Entity cache — `src/blocking/entity_cache.py`
-
-This reads `outputs/parquet/` and writes normalized, integer-ID caches to
-`outputs/normalized/`:
-
-- `train_source{1,2,3}.parquet` with the columns `id` (int32), `country`, `norm_name`
-  and `norm_address`
-- `train_truth.parquet` with `s1_id`, `target_source` (2/3) and `target_id`
-
-Every later stage reads one country partition at a time from this cache.
-
-```bash
-python -m src.blocking.entity_cache            # --workers 8 (default), --force to rebuild
+│   ├── dataset/
+│   │   ├── train/  train_source1.tsv  train_source2.tsv  train_source3.tsv  train_ground_truth.tsv
+│   │   └── test/   test_source1.tsv   test_source2.tsv   test_source3.tsv
+│   └── utils/validate_submission.py
+└── solution/        ← this repository (any folder name works, as long as it sits here)
 ```
 
 ---
 
-## 7. Candidate generation
-
-### Architecture — `src/blocking/candidate_pipeline.py`
-
-For each target source (S2, S3) and each country partition:
-
-1. Load the target partition and fit all four channels once.
-2. Process S1 in chunks (`--chunk-size`, default 50,000).
-3. Run every channel on the chunk, union the results on integer (S1, target) keys,
-   and deduplicate them.
-4. Write one Parquet part per chunk:
-   `outputs/candidates/<run>/target=S2/country=us/part-00000.parquet`.
-
-The full candidate set is never held in memory, only one chunk at a time.
-`open_candidates(<run dir>)` returns a lazy `pyarrow` dataset over all parts.
-
-Each candidate row has these columns:
-
-| Column | Meaning |
-| --- | --- |
-| `s1_id`, `target_id` | integer IDs (the `S1-`/`S2-`/`S3-` prefix removed) |
-| `target_source` | 2 = S2, 3 = S3 |
-| `country` | normalized country of the partition |
-| `candidate_source_mask` | bitmask: `exact_name`=1, `name_char`=2, `address_char`=4, `house_city`=8 |
-| `exact_name_rank` | position within the exact-name block (−1 if not retrieved) |
-| `name_char_rank`, `name_char_score` | name channel rank (−1) and full-cosine score (NaN) |
-| `address_char_rank`, `address_char_score` | address channel rank (−1) and full-cosine score (NaN) |
-| `house_city_hit` | retrieved by the house-number + city channel |
-
-Each run directory also contains:
-
-- `manifest.json`: config, schema, per-part counts and bytes, fit times, peak
-  memory, and code version (git HEAD, dirty flag, SHA-256 of the blocking and
-  preprocessing sources)
-- the learned city lexicons (`lexicon_{country}.txt`)
-- for sampled runs, `s1_ids.parquet`
-
-These are enough to regenerate the candidate set exactly.
-
-### Measured recall
-
-All figures are **candidate recall against training ground truth**. The final
-design was selected on a **random sample of 20,000 training S1 entities (seed 42)**
-evaluated against the **complete** S2/S3 training populations. These are
-blocking-stage results, **not** test or leaderboard performance.
-
-| Configuration | S2 recall | S3 recall | Scope |
-| --- | --- | --- | --- |
-| Exact normalized name | 41.49% | 40.11% | all 2.2M training S1 |
-| Exact normalized name | 41.56% | 39.76% | 20k-S1 sample |
-| Name char, pruned top-100 (no rerank) | 65.88% | 62.54% | 20k-S1 sample |
-| Name char, rerank 1000 → top-100 | 71.35% | 70.10% | 20k-S1 sample |
-| Exact ∪ name-char rerank | 73.75% | 73.03% | 20k-S1 sample |
-| … ∪ address-char rerank K=25 | 96.61% | 96.02% | 20k-S1 sample |
-| **… ∪ house-number + city (block ≤ 1000) — final** | **97.35%** | **97.04%** | 20k-S1 sample |
-
-For the final union on the 20k sample:
-
-| | S2 | S3 |
-| --- | --- | --- |
-| Candidate pairs | 3,433,276 | 3,493,526 |
-| Candidates per S1: mean / median / max | 171.7 / 125 / 1,113 | 174.7 / 125 / 1,133 |
-
-Every sampled S1 entity has at least one candidate.
-
-The full 2.2M-S1 candidate set has **not** been generated yet.
-
----
-
-## 8. Candidate validation
-
-`src/blocking/validate_candidates.py` streams a candidate run one part at a time
-and checks:
-
-1. **No duplicates.** Within each part, (s1_id, target_id) is strictly increasing,
-   and no S1 entity appears in more than one part.
-2. **Country consistency.** Every S1 and target ID exists in the part's country
-   partition, and the `country` and `target_source` columns match the part.
-3. **Channel provenance.** Mask bits agree with the rank, score and hit columns,
-   and no row has an empty or unknown mask.
-4. **Exact-name correctness and completeness.** Every `exact_name` pair has equal,
-   non-empty normalized names, and every same-name target is present.
-5. **House-city correctness and completeness.** Every `house_city` pair shares a
-   non-empty key, only blocks of at most 1,000 targets are used, and those blocks
-   are complete.
-6. **Rank and score checks.** Char-channel ranks are 0…n−1 per S1 and below K;
-   scores are in [0, 1] and never increase with rank.
-7. **Per-S1 counts.** Mean, median, p99 and maximum candidates per S1.
-8. **Streaming iteration.** All parts are read through `open_candidates` in
-   batches, and the row count must equal the manifest total.
-9. **Determinism** (`--compare <other run>`). The configs are equal, the part
-   files are the same, and the content is identical (NaN-aware comparison).
-
-`--recall` also reports recall per target and per channel against ground truth.
-
-On the 20k sample, two independent pipeline runs with the same seed and config
-produced **identical candidate content**, and all checks passed. The validator was
-also confirmed to catch an injected duplicate row, a flipped provenance bit and a
-dropped `house_city` row.
-
----
-
-## 9. Pairwise feature extraction
-
-`src/features/pairwise.py` reads a candidate run one part at a time and writes one
-feature part per candidate part: `outputs/features/<run>/target=…/country=…/part-*.parquet`.
-
-- Transliteration and address keys are computed once per unique entity in a part.
-- Features are float32 (flags are int8) and IDs are int32.
-- The candidate set is never modified.
-
-| Group | Features |
-| --- | --- |
-| Name (`text_features.py`) | `name_exact`, `name_ratio`, `name_partial_ratio`, `name_token_sort_ratio`, `name_token_set_ratio`, `name_token_jaccard`, `translit_name_ratio`, `translit_name_token_jaccard` |
-| Address (`address_features.py`) | `address_ratio`, `address_partial_ratio`, `address_token_sort_ratio`, `address_token_set_ratio`, `address_token_jaccard` |
-| Structured (`address_features.py`) | `house_number_match`, `city_match`, `house_city_match`, `country_match` |
-| Retrieval (`retrieval_features.py`) | `exact_name_hit`, `name_char_hit`, `address_char_hit`, `house_city_hit`, `n_channels`, `name_char_rank`, `name_char_score`, `address_char_rank`, `address_char_score`, `best_name_rank`, `best_address_rank`, `s1_candidate_count` |
-| Missingness | `s1_name_missing`, `target_name_missing`, `s1_address_missing`, `target_address_missing` |
-
-String similarities use RapidFuzz (`cpdist`, multi-threaded element-wise) and are
-scaled to [0, 1].
-
-**Missing-value handling:**
-
-- Name and address similarities, including the transliterated ones and
-  `name_exact`, are **NaN when either side's text is empty**. Missing text is
-  never treated as "dissimilar".
-- Structured matches (house number, city, house + city) are 1 or 0, and NaN
-  when either side has no extracted key.
-- Retrieval ranks and scores are NaN when that channel did not retrieve the pair.
-- `best_name_rank` is 0 for exact-name hits, otherwise the name-char rank.
-- `best_address_rank` is 0 for house-city hits, otherwise the address-char rank.
-- The four `*_missing` flags record empty normalized name or address explicitly.
-
-Each row also has `s1_id`, `target_id`, `target_source`, `country`, `split`
-(0 = train, 1 = validation) and `label`.
-
----
-
-## 10. Candidate labeling
-
-`src/evaluation/labels.py`:
-
-- **Labels from ground truth.** `label = 1` if and only if the candidate's
-  target is in that S1 entity's `matched_entity_ids`, otherwise 0.
-- **S2 and S3 are kept separate.** `TruthIndex` is built for one target source
-  and raises an error if it is given candidates from the other source. An S2
-  candidate can never be labeled from S3 truth, or the reverse.
-- **Empty `matched_entity_ids`** means the S1 entity has no true target. It has no
-  truth rows, so all of its candidates are negatives.
-- **Independent check.** `raw_truth_strings` rebuilds the links as `"S1-…|S2-…"`
-  strings directly from the raw TSV, without the integer cache. The audit uses it
-  to re-verify every label.
-
-**S1-level split.** `src/evaluation/split.py` (`make_s1_validation_split`) assigns
-each S1 entity entirely to train or validation. All candidates of an S1 entity stay
-in one split, which prevents leakage between candidate rows. `pairwise.py` uses a
-validation fraction of 0.2 and seed 42 by default, and saves the assignment to
-`split.parquet`.
-
----
-
-## 11. Feature audit results (20k-S1 sample)
-
-From `python -m src.features.audit_features` on the 20k-sample feature set. These
-are **sample / development observations**, not final model or test results.
-
-| Metric | Value |
-| --- | --- |
-| Candidate pairs | 6,926,802 |
-| Positive pairs | 66,996 (S2 32,535, S3 34,461) |
-| Negative pairs | 6,859,806 |
-| Positive rate | 0.967% |
-| Positives per S1 | S2 mean 1.63 (max 5), S3 mean 1.72 (max 6) |
-| Negatives per S1 | S2 mean 170, S3 mean 173 (median 124) |
-| Train / validation S1 | 16,000 / 4,000 (zero overlap) |
-| Train / validation positives | 53,632 / 13,364 |
-| Label disagreements vs raw ground truth | 0 |
-| Candidate recall for the sampled S1 (S2+S3) | 97.19% (66,996 / 68,931 true links) |
-
-Observations:
-
-- **High name similarity alone produces many false positives.** 783,863 negatives
-  (11.3% of all candidates) have a name ratio of at least 0.9. Only about 4% of
-  candidates with *identical* names are true matches; the rest are mostly generic
-  names in different cities.
-- **Address similarity is more discriminative.** 44% (S2) and 55% (S3) of
-  candidates with an address ratio of at least 0.9 are positive. Address token
-  Jaccard averages 0.64 for positives and 0.10 for negatives. The remaining hard
-  negatives are mostly neighbouring units or other businesses in the same building.
-- **House-city-only candidates are numerous and almost all negative.** 1.70M rows
-  (24.5% of candidates) contain 611 positives, a 0.036% positive rate.
-- **Constant or duplicate features.**
-  - `country_match`, `s1_name_missing` and `s1_address_missing` are constant.
-  - `name_exact` is identical to `exact_name_hit`.
-  - `house_city_match` is almost identical to `house_city_hit` (r = 0.991).
-- **F0.5 makes precision important.** With about 1 positive per 100 candidates,
-  and many high-name-similarity negatives, the matcher and decision layer must
-  favour precision.
-
----
-
-## 12. Reproducing the current benchmark
-
-Run these from the repository root with the environment activated. Runtimes are
-from logs on the development machine (16 cores, 8 workers).
+## Running Tests
 
 ```bash
-# 1. Train TSV -> Parquet (outputs/parquet/)
-python -m src.data.convert
+python -m unittest discover -s tests -v
+```
 
-# 2. Normalized integer-ID cache + truth cache (outputs/normalized/)   ~45 s
-python -m src.blocking.entity_cache
+61 tests (standard-library `unittest`; no pytest needed) covering numeric address features, name
+rarity, transliteration skeletons, false-positive analysis helpers, S1-context features and rules,
+country support, exact S1 grouping, output writing, and a tiny end-to-end production run with
+resume. The end-to-end test uses the trained model artifacts under `outputs/` and is **skipped**
+when they are absent (e.g. on a fresh clone); it relies on `fork`, so it is not expected to pass on
+native Windows.
 
-# 3. Candidate generation on the 20k-S1 sample                          ~11 min
-python -m src.blocking.candidate_pipeline \
-    --out outputs/candidates/sample20k_a --s1-sample 20000 --seed 42 --chunk-size 5000
+---
 
-# 4. Candidate validation + recall                                      ~2.5 min
+## Running Inference
+
+### Reproducing the model artifacts
+
+> **A fresh clone does not contain `outputs/`.** Because `outputs/` is git-ignored, the repository
+> ships **no** entity caches, trained base-model artifacts (`outputs/experiments/xgb_skeleton/`),
+> second-stage artifacts (`outputs/experiments/s1_context/`) or generated city lexicons
+> (`outputs/candidates/sample20k_a/lexicon_*.txt`). Reproduce them with the commands below
+> **before** running full test inference; `run_pipeline` uses these paths by default.
+
+These are the module invocations used during development (training data only; roughly an hour in
+total on the development machine, the OOF step being the longest at ~12 min):
+
+```bash
+python -m src.data.convert --datasets train test
+python -m src.blocking.entity_cache --datasets train test
+
+# Development candidate set (also provides the city lexicons used for test)
+python -m src.blocking.candidate_pipeline --out outputs/candidates/sample20k_a \
+    --s1-sample 20000 --seed 42 --chunk-size 5000
 python -m src.blocking.validate_candidates outputs/candidates/sample20k_a --recall
 
-#    Optional determinism check: generate a second run and compare
-python -m src.blocking.candidate_pipeline \
-    --out outputs/candidates/sample20k_b --s1-sample 20000 --seed 42 --chunk-size 5000
-python -m src.blocking.validate_candidates outputs/candidates/sample20k_a \
-    --recall --compare outputs/candidates/sample20k_b
+# Features + base matcher
+python -m src.features.pairwise outputs/candidates/sample20k_a --out outputs/features/sample20k_skeleton
+python -m src.models.xgb_matcher outputs/features/sample20k_skeleton --name xgb_skeleton
 
-# 5. Pairwise features + labels + S1 split (outputs/features/sample20k/) ~100 s
-python -m src.features.pairwise outputs/candidates/sample20k_a --out outputs/features/sample20k
-
-# 6. Feature / label audit                                              ~15 s
-python -m src.features.audit_features outputs/features/sample20k
+# Second stage: out-of-fold base scores, then the S1-context model
+python -m src.decision.oof outputs/experiments/xgb_skeleton outputs/features/sample20k_skeleton \
+    --out outputs/experiments/s1_context
+python -m src.decision.s1_context outputs/experiments/xgb_skeleton outputs/features/sample20k_skeleton \
+    --oof outputs/experiments/s1_context --compare outputs/experiments/xgb_skeleton
 ```
 
-`candidate_pipeline` and `pairwise` refuse to write into an existing output
-directory. Delete the directory or pick a new `--out`.
+`--compare` names a reference experiment whose validation predictions are added to the comparison
+table (the row is labelled "xgb_rarity (reference)" in the output; development used `xgb_rarity`,
+and any experiment with validation predictions for the same candidates works).
 
-The research benchmarks behind the channel choices can also be rerun. Unless noted,
-each one evaluates the 20k sample against the complete target populations. Logged
-runtimes range from about 1 minute (exact name) to about 25 minutes
-(`benchmark_address_union`):
+### Full test inference
 
 ```bash
-python -m src.blocking.profile_true_matches --sample 50000 --seed 42
-python -m src.blocking.benchmark_candidates --channels exact            # all 2.2M S1, ~1 min
-python -m src.blocking.benchmark_candidates --channels char --s1-sample 20000 --estimate-only
-python -m src.blocking.diagnose_union --rerank-pool 1000 --renormalize-pruned
-python -m src.blocking.benchmark_address_union
-python -m src.blocking.benchmark_translit_union
-python -m src.blocking.benchmark_structured_union
+python -m src.inference.run_pipeline \
+  --dataset test \
+  --out outputs/production/test_v1 \
+  --chunk-size 10000
 ```
 
----
+Defaults: `--base-experiment outputs/experiments/xgb_skeleton`,
+`--second-stage outputs/experiments/s1_context`, `--lexicon-dir outputs/candidates/sample20k_a`,
+`--workers 8`, `--seed 42`. `--stages` runs a subset (e.g. skip `validate`); `--s1-sample N` runs a
+small smoke test. If the run is interrupted, **re-run the same command** to resume.
 
-## 13. Reproducibility
+Estimated from measured development runs (not a completed full run): ~606M candidate rows,
+~9.6 h without the validation stage (~13 h with it), ~6 GB peak RAM at chunk size 10,000, ~49 GB disk.
 
-- **Seeds.**
-  - The 20k S1 sample uses `numpy.random.default_rng(42)` (`--s1-sample 20000 --seed 42`).
-  - The S1 train/validation split uses validation fraction 0.2 and seed 42.
-  - The audit's negative subsample uses seed 0.
-- **Determinism.** Two independent candidate runs with the same config produced
-  identical content (checked with `validate_candidates --compare`).
-- **Version tracking.**
-  - Each candidate `manifest.json` records the git HEAD, a dirty-tree flag and a
-    SHA-256 hash of the `src/blocking` and `src/preprocessing` sources.
-  - The feature manifest copies this information and records the split settings
-    and feature columns.
-- **S1-level split** as described in [Candidate labeling](#10-candidate-labeling).
-- **Generated outputs are ignored by git.** `outputs/`, `logs/`, `cache/`, `models/`,
-  `artifacts/` and `/data/` are in `.gitignore`.
-- **Do not commit the dataset or generated Parquet artifacts** (caches, candidates,
-  features). They are large and reproducible from the commands above.
+Run directory:
+
+```text
+outputs/production/test_v1/
+├── run_manifest.json
+├── candidates/   features/   scores/   decisions/
+└── submission/output/{matching_results.tsv, candidate_pairs.tsv}
+```
+
+All of it is git-ignored.
 
 ---
 
-## 14. Current results summary
+## Submission Outputs
 
-| Stage | Result | Scope |
-| --- | --- | --- |
-| Exact-name blocking | S2 41.49%, S3 40.11% candidate recall | all 2.2M training S1, full S2/S3 |
-| Final candidate union | S2 97.35%, S3 97.04% candidate recall; about 173 candidates per S1 | 20k training S1 sample (seed 42), full S2/S3 |
-| Candidate validation | all checks passed; repeated runs identical | 20k-sample candidate run |
-| Feature extraction | 6,926,802 labeled pairs × 33 features, 155 MB Parquet, about 100 s | 20k-sample candidate run |
-| Label verification | 0 disagreements with raw ground truth | all 6.9M sample candidate pairs |
-| Candidate recall (S2+S3 combined) | 97.19% (66,996 / 68,931 true links) | 20k training S1 sample |
+| File | Content |
+|---|---|
+| `matching_results.tsv` | `source1_entity_id`, `matched_entity_ids` — one row per test S1; comma-separated S2/S3 IDs of accepted matches, empty when none (the leaderboard file) |
+| `candidate_pairs.tsv` | `source1_entity_id`, `candidate_entity_ids` — one row per test S1; every candidate the matcher scored (the exact model input set), empty when blocking found none |
 
-None of these numbers is a matching F0.5 or a test/leaderboard result. No matcher
-has been trained yet.
+Every S1 appears exactly once; matched IDs are always a subset of the S1's candidates.
+
+## Submission Validation
+
+From `student_resource/` (the challenge's stdlib-only validator):
+
+```bash
+python3 utils/validate_submission.py \
+  --matching ../solution/outputs/production/test_v1/submission/output/matching_results.tsv \
+  --candidate ../solution/outputs/production/test_v1/submission/output/candidate_pairs.tsv \
+  --test-dir dataset/test
+```
+
+`--check-ids` additionally verifies that every ID exists in the test S2/S3 files (uses several GB of RAM).
 
 ---
 
-## 15. Next step
+## Reproducibility
 
-**Next stage:** train and validate the first XGBoost pairwise matcher using the
-generated feature dataset, with the S1-level split and per-S1 macro F0.5.
+- `run_manifest.json` (production): `created`; `candidate_config` (chunk size, seed, workers, dataset,
+  lexicon directory, blocking settings); SHA-256 of the base model, its feature list, the second-stage
+  model and metadata, and each lexicon; SHA-256 of the input TSVs (unless `--skip-input-hash`); per
+  invocation: git HEAD, dirty flag, SHA-256 of the `src/blocking` and `src/preprocessing` sources,
+  Python version, platform and package versions; per-stage finish times.
+- Stage manifests: candidate config, schema, lexicon origin and hashes, per-part counts; scoring and
+  decision manifests record the model hashes, second-stage feature list, floor and threshold.
+- Seeds: S1 sample and split seed 42; XGBoost `random_state` 42; OOF folds seeded.
+- Candidate generation is deterministic (repeated runs produce identical parts).
 
-Model training has **not** been implemented yet. The decision/threshold layer,
-set-level matching, full-scale and test inference (including support for the
-unseen `France` country) and submission packaging also remain to be built.
+---
+
+## Current Status
+
+Implemented and verified:
+
+- The end-to-end pipeline (data → candidates → features → matcher → decision → output files) is
+  implemented for both training and test data.
+- It has been validated on development data (the 20k-S1 training sample) and on a small test-data
+  smoke run — **not** on the complete test dataset.
+- On the development data, the production inference path reproduces the frozen experiments exactly
+  (identical features, base scores and second-stage probabilities; validation macro F0.5 0.9254).
+- A 600-S1 smoke run on **test** data (including France) of the candidate, validation and feature
+  stages completed without errors during development.
+
+Not yet done:
+
+- **Full test inference has not been run**, and no submission has been generated or scored.
+
+## Limitations
+
+- **France / unsupported countries:** no city or house+city keys (no validated address rules), so
+  one blocking channel and two structured features are unavailable for them.
+- Candidate recall is ~97% on the training sample; missed links (mostly Indian cross-script names and
+  renamed businesses at weak addresses) cannot be recovered by the matcher.
+- The base model and second stage are trained on a 20k-S1 training sample.
+- Full-scale runtime and memory figures are estimates extrapolated from measured runs.
+- Entity-cache building and candidate generation require `fork`: run them on Linux (or WSL2), not native Windows.
+- `candidate_pairs.tsv` for the full test set is large (several GB).
+
+## License
+
+The repository does not currently include a license file. Third-party dependencies (e.g. XGBoost,
+Apache-2.0) keep their own licenses.
