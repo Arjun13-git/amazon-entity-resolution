@@ -17,6 +17,7 @@ never modified or re-generated here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -28,12 +29,24 @@ import pyarrow.parquet as pq
 
 from src.blocking.address_keys import extract_keys
 from src.blocking.benchmark_candidates import TARGET_FILES, locate
+from src.blocking.candidate_pipeline import atomic_write_json, atomic_write_parquet
 from src.blocking.entity_cache import load_partition
 from src.evaluation.labels import TruthIndex
 from src.evaluation.split import make_s1_validation_split
-from src.features.address_features import address_features, structured_features
+from src.features.address_features import (
+    address_features,
+    extract_numbers,
+    numeric_features,
+    structured_features,
+)
 from src.features.retrieval_features import retrieval_features
-from src.features.text_features import name_features
+from src.features.text_features import (
+    name_features,
+    name_frequency,
+    name_rarity_features,
+    skeleton_features,
+    skeleton_from_translit,
+)
 from src.preprocessing.transliterate import transliterate_text
 
 
@@ -43,13 +56,15 @@ ID_COLUMNS = ["s1_id", "target_id", "target_source", "country", "split", "label"
 class EntityLookup:
     """Normalized name/address of one source's country partition, by id."""
 
-    def __init__(self, source: str, country: str, ids: np.ndarray | None = None):
-        df = load_partition(source, country, ["norm_name", "norm_address"])
+    def __init__(self, source: str, country: str, ids: np.ndarray | None = None, dataset: str = "train"):
+        df = load_partition(source, country, ["norm_name", "norm_address"], dataset)
 
         if ids is not None:
             df = df[np.isin(df["id"].to_numpy(), ids)].reset_index(drop=True)
 
         self.country = country
+        self.complete = ids is None
+        self._name_frequency = None
         self.ids = df["id"].to_numpy()
         self.name = df["norm_name"].fillna("").to_numpy(dtype=object)
         self.address = df["norm_address"].fillna("").to_numpy(dtype=object)
@@ -64,8 +79,24 @@ class EntityLookup:
 
         return pos
 
+    @property
+    def name_frequency(self) -> np.ndarray:
+        """
+        Entities in this (source, country) partition sharing each entity's
+        normalized name; NaN for empty names. Computed once, from the
+        entity population only (no labels).
+        """
+
+        if not self.complete:
+            raise ValueError("name frequency needs the complete partition, not an id subset")
+
+        if self._name_frequency is None:
+            self._name_frequency = name_frequency(self.name)
+
+        return self._name_frequency
+
     def derived(self, pos: np.ndarray, lexicon: frozenset[str]) -> dict[str, np.ndarray]:
-        """Translit name and address keys for the given rows (computed once per unique row)."""
+        """Translit name, address keys and address numbers for the given rows (once per unique row)."""
 
         uniq, inverse = np.unique(pos, return_inverse=True)
 
@@ -76,8 +107,15 @@ class EntityLookup:
             pd.Series(self.address[uniq]), self.country, lexicon
         )
 
+        numbers = np.empty(len(uniq), dtype=object)
+        numbers[:] = [extract_numbers(a) for a in self.address[uniq]]
+
         return {
             "translit": translit[inverse],
+            "skeleton": np.array(
+                [skeleton_from_translit(t) for t in translit], dtype=object
+            )[inverse],
+            "numbers": numbers[inverse],
             **{k: keys[k].to_numpy(dtype=object)[inverse] for k in ("house", "city", "house_city")},
         }
 
@@ -124,8 +162,18 @@ def part_features(
     features.update(
         name_features(s1_name, t_name, s1_derived["translit"], t_derived["translit"])
     )
+    features.update(skeleton_features(s1_derived["skeleton"], t_derived["skeleton"]))
+    features.update(name_rarity_features(tg.name_frequency[t_pos]))
     features.update(address_features(s1_addr, t_addr))
     features.update(structured_features(s1_derived, t_derived, country_match))
+    features.update(
+        numeric_features(
+            s1_derived["numbers"],
+            t_derived["numbers"],
+            s1_addr == "",
+            t_addr == "",
+        )
+    )
     features.update(retrieval_features(candidates))
     features.update(
         {
@@ -139,12 +187,43 @@ def part_features(
     return features
 
 
-def run(candidate_dir: Path, out_dir: Path, validation_fraction: float, seed: int) -> dict:
+def run(
+    candidate_dir: Path,
+    out_dir: Path,
+    validation_fraction: float,
+    seed: int,
+    resume: bool = False,
+) -> dict:
+    """
+    Feature parts for every candidate part. Restartable: parts are written
+    atomically with a JSON sidecar and skipped on ``resume``.
 
-    out_dir.mkdir(parents=True, exist_ok=False)
+    Training data (``dataset == "train"``) gets labels and the S1 split.
+    Other datasets (test) have no ground truth: ``label`` and ``split`` are
+    written as -1 and the truth tables are never consulted.
+    """
+
     started = time.perf_counter()
 
     cand_manifest = json.loads((candidate_dir / "manifest.json").read_text())
+    dataset = cand_manifest["config"].get("dataset", "train")
+    labelled = dataset == "train"
+
+    run_config = {
+        "candidate_dir": str(candidate_dir),
+        "candidate_manifest_sha256": hashlib.sha256((candidate_dir / "manifest.json").read_bytes()).hexdigest(),
+        "dataset": dataset,
+        "validation_fraction": validation_fraction,
+        "seed": seed,
+    }
+    if out_dir.exists():
+        if not resume:
+            raise FileExistsError(f"{out_dir} exists (use --resume to continue it)")
+        if json.loads((out_dir / "config.json").read_text()) != run_config:
+            raise ValueError("feature run config differs from the run being resumed")
+    else:
+        out_dir.mkdir(parents=True)
+        atomic_write_json(out_dir / "config.json", run_config)
 
     lexicons = {
         country: frozenset((candidate_dir / info["file"]).read_text().split())
@@ -153,45 +232,50 @@ def run(candidate_dir: Path, out_dir: Path, validation_fraction: float, seed: in
 
     s1_path = candidate_dir / "s1_ids.parquet"
     s1_ids = pq.read_table(s1_path)["s1_id"].to_numpy() if s1_path.exists() else None
-
-    if s1_ids is None:
-        s1_ids = np.concatenate(
-            [load_partition("source1", c, [])["id"].to_numpy() for c in lexicons]
-        )
-
-    split = build_split(s1_ids, validation_fraction, seed)
-    pq.write_table(pa.Table.from_pandas(split, preserve_index=False), out_dir / "split.parquet")
-    split_ids = split["s1_id"].to_numpy()
-    split_flag = split["split"].to_numpy()
-
-    truth = {
-        target: TruthIndex(target, s1_ids)
-        for target in cand_manifest["config"]["targets"]
-    }
+    countries = sorted({p["country"] for p in cand_manifest["parts"]})
 
     manifest = {
         "candidate_dir": str(candidate_dir),
         "candidate_code": cand_manifest["code"],
-        "split": {
+        "dataset": dataset,
+        "parts": [],
+    }
+
+    if labelled:
+        if s1_ids is None:
+            s1_ids = np.concatenate(
+                [load_partition("source1", c, [], dataset)["id"].to_numpy() for c in countries]
+            )
+        split = build_split(s1_ids, validation_fraction, seed)
+        if not (out_dir / "split.parquet").exists():
+            atomic_write_parquet(pa.Table.from_pandas(split, preserve_index=False), out_dir / "split.parquet")
+        split_ids = split["s1_id"].to_numpy()
+        split_flag = split["split"].to_numpy()
+        truth = {target: TruthIndex(target, s1_ids) for target in cand_manifest["config"]["targets"]}
+        manifest["split"] = {
             "validation_fraction": validation_fraction,
             "seed": seed,
             "train_s1": int((split_flag == 0).sum()),
             "validation_s1": int((split_flag == 1).sum()),
-        },
-        "parts": [],
-    }
+        }
 
     parts = sorted(cand_manifest["parts"], key=lambda p: (p["target"], p["country"], p["file"]))
     current = None
 
     for meta in parts:
-        key = (meta["target"], meta["country"])
+        path = out_dir / meta["file"]
+        sidecar = path.with_suffix(".json")
 
+        if sidecar.exists():
+            manifest["parts"].append(json.loads(sidecar.read_text()))
+            continue
+
+        key = (meta["target"], meta["country"])
         if key != current:
             current = key
             target, country = key
-            s1 = EntityLookup("source1", country, s1_ids)
-            tg = EntityLookup(TARGET_FILES[target], country)
+            s1 = EntityLookup("source1", country, s1_ids, dataset)
+            tg = EntityLookup(TARGET_FILES[target], country, None, dataset)
             print(f"[{target} | {country}] lookups: S1 {len(s1.ids):,}, targets {len(tg.ids):,}", flush=True)
 
         part_start = time.perf_counter()
@@ -203,50 +287,58 @@ def run(candidate_dir: Path, out_dir: Path, validation_fraction: float, seed: in
         target_id = candidates["target_id"].to_numpy()
         target_source = candidates["target_source"].to_numpy()
 
-        split_pos = locate(split_ids, s1_id)
-        if (split_pos < 0).any():
-            raise ValueError("candidate S1 without a split assignment")
+        if labelled:
+            split_pos = locate(split_ids, s1_id)
+            if (split_pos < 0).any():
+                raise ValueError("candidate S1 without a split assignment")
+            split_col = split_flag[split_pos]
+            label_col = truth[target].label(s1_id, target_id, target_source)
+        else:
+            split_col = np.full(len(s1_id), -1, dtype=np.int8)
+            label_col = np.full(len(s1_id), -1, dtype=np.int8)
 
         columns = {
             "s1_id": s1_id,
             "target_id": target_id,
             "target_source": target_source,
             "country": candidates["country"],
-            "split": split_flag[split_pos],
-            "label": truth[target].label(s1_id, target_id, target_source),
+            "split": split_col,
+            "label": label_col,
             **features,
         }
 
         table = pa.table(columns)
-        path = out_dir / meta["file"]
         path.parent.mkdir(parents=True, exist_ok=True)
-        pq.write_table(table, path, compression="zstd")
+        atomic_write_parquet(table, path)
 
         elapsed = time.perf_counter() - part_start
-        manifest["parts"].append(
-            {
-                "file": meta["file"],
-                "target": target,
-                "country": country,
-                "rows": table.num_rows,
-                "positives": int(columns["label"].sum()),
-                "bytes": path.stat().st_size,
-                "seconds": round(elapsed, 1),
-            }
-        )
+        record = {
+            "file": meta["file"],
+            "target": meta["target"],
+            "country": meta["country"],
+            "part": meta.get("part"),
+            "rows": table.num_rows,
+            "positives": int(label_col.sum()) if labelled else None,
+            "bytes": path.stat().st_size,
+            "seconds": round(elapsed, 1),
+        }
+        atomic_write_json(sidecar, record)
+        manifest["parts"].append(record)
         print(
-            f"  {meta['file']}: {table.num_rows:,} rows, "
-            f"{int(columns['label'].sum()):,} positives, {elapsed:.1f}s",
+            f"  {meta['file']}: {table.num_rows:,} rows"
+            + (f", {record['positives']:,} positives" if labelled else "")
+            + f", {elapsed:.1f}s",
             flush=True,
         )
 
         del candidates, features, table, columns
 
-    manifest["feature_columns"] = [c for c in pq.read_schema(out_dir / parts[0]["file"]).names if c not in ID_COLUMNS]
-    manifest["schema"] = pq.read_schema(out_dir / parts[0]["file"]).to_string()
+    first = out_dir / parts[0]["file"]
+    manifest["feature_columns"] = [c for c in pq.read_schema(first).names if c not in ID_COLUMNS]
+    manifest["schema"] = pq.read_schema(first).to_string()
     manifest["runtime_seconds"] = round(time.perf_counter() - started, 1)
 
-    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    atomic_write_json(out_dir / "manifest.json", manifest)
 
     return manifest
 
@@ -261,9 +353,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--validation-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action="store_true", help="Continue an interrupted run in --out.")
     args = parser.parse_args()
 
-    manifest = run(args.candidate_dir, args.out, args.validation_fraction, args.seed)
+    manifest = run(args.candidate_dir, args.out, args.validation_fraction, args.seed, resume=args.resume)
 
     print(
         f"\nDone: {sum(p['rows'] for p in manifest['parts']):,} rows, "
