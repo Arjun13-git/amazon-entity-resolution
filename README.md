@@ -31,8 +31,10 @@ Results measured on a 20,000-S1 training sample (validation = 4,000 held-out S1;
 | Base XGBoost matcher (`xgb_skeleton`), validation macro F0.5 | 0.9181 |
 | + S1-level contextual decision layer, validation macro F0.5 | **0.9254** |
 
-The production inference pipeline for the full test set is implemented, tested and restartable,
-but **has not yet been run on the complete test dataset**.
+The production inference pipeline for the full test set is implemented, tested and restartable, and
+has been **run on the complete test dataset** (1,732,544 S1); the resulting `matching_results.tsv`
+passed the official submission validator (see [Current Status](#current-status)). No leaderboard
+score is known yet.
 
 ---
 
@@ -436,8 +438,10 @@ Defaults: `--base-experiment outputs/experiments/xgb_skeleton`,
 `--workers 8`, `--seed 42`. `--stages` runs a subset (e.g. skip `validate`); `--s1-sample N` runs a
 small smoke test. If the run is interrupted, **re-run the same command** to resume.
 
-Estimated from measured development runs (not a completed full run): ~606M candidate rows,
-~9.6 h without the validation stage (~13 h with it), ~6 GB peak RAM at chunk size 10,000, ~49 GB disk.
+Measured on the completed full test run (`outputs/production/test_v1`, chunk size 10,000, 8 workers,
+16 cores / 23 GB RAM): 617,773,353 candidate rows; ≈ 8.4 h for all six stages (candidates ≈ 5.0 h,
+validate ≈ 4 min, features ≈ 2.7 h, scores ≈ 14 min, decisions ≈ 10 min, submission ≈ 12 min);
+candidate-stage peak RSS ≈ 5.6 GB; ≈ 46 GB on disk for the run directory.
 
 Run directory:
 
@@ -463,7 +467,21 @@ Every S1 appears exactly once; matched IDs are always a subset of the S1's candi
 
 ## Submission Validation
 
-From `student_resource/` (the challenge's stdlib-only validator):
+Run from `student_resource/` (the challenge's stdlib-only validator).
+
+**Validation performed for the full test run** — `matching_results.tsv` only, without `--candidate`
+and without `--check-ids`:
+
+```bash
+python3 utils/validate_submission.py \
+  --matching ../solution/outputs/production/test_v1/submission/output/matching_results.tsv \
+  --test-dir dataset/test
+```
+
+`candidate_pairs.tsv` was checked separately with streaming structural checks (results in
+[Current Status](#current-status)).
+
+**General / full validation command** (matching results and candidate pairs together):
 
 ```bash
 python3 utils/validate_submission.py \
@@ -471,6 +489,10 @@ python3 utils/validate_submission.py \
   --candidate ../solution/outputs/production/test_v1/submission/output/candidate_pairs.tsv \
   --test-dir dataset/test
 ```
+
+> **Warning:** validating the full ≈ 8 GB `candidate_pairs.tsv` this way can require substantial
+> resources; on the development machine it caused excessive resource usage and froze the desktop
+> session, so it was not completed for the full test run.
 
 `--check-ids` additionally verifies that every ID exists in the test S2/S3 files (uses several GB of RAM).
 
@@ -487,6 +509,8 @@ python3 utils/validate_submission.py \
   decision manifests record the model hashes, second-stage feature list, floor and threshold.
 - Seeds: S1 sample and split seed 42; XGBoost `random_state` 42; OOF folds seeded.
 - Candidate generation is deterministic (repeated runs produce identical parts).
+- The full test run's `run_manifest.json` records one invocation of all six stages at git HEAD
+  `a23f0ba` with a clean working tree, plus SHA-256 hashes of the three test TSVs.
 
 ---
 
@@ -497,15 +521,36 @@ Implemented and verified:
 - The end-to-end pipeline (data → candidates → features → matcher → decision → output files) is
   implemented for both training and test data.
 - It has been validated on development data (the 20k-S1 training sample) and on a small test-data
-  smoke run — **not** on the complete test dataset.
+  smoke run, and has been run on the complete test dataset (below).
 - On the development data, the production inference path reproduces the frozen experiments exactly
   (identical features, base scores and second-stage probabilities; validation macro F0.5 0.9254).
 - A 600-S1 smoke run on **test** data (including France) of the candidate, validation and feature
   stages completed without errors during development.
 
+Full test inference (`outputs/production/test_v1`, completed):
+
+- Dataset `test`: 1,732,544 S1 processed; candidate rows S2 307,282,922 + S3 310,490,431 =
+  617,773,353; the candidate-validation stage passed.
+- Final outputs in `outputs/production/test_v1/submission/output/`:
+  - `matching_results.tsv` — 1,732,544 data rows + header (95,490,011 bytes, ≈ 95 MB);
+    1,620,027 S1 with at least one match, 112,517 with an empty match list; 5,667,444 matched
+    entity IDs in total.
+  - `candidate_pairs.tsv` — 1,732,544 data rows + header (7,984,780,287 bytes, ≈ 8.0 GB / 7.4 GiB).
+
+Validation of the final files:
+
+- **`matching_results.tsv` passed the official validator** (`utils/validate_submission.py`, run
+  without `--candidate`): "PASS — no blocking issues found. Safe to submit."
+- **`candidate_pairs.tsv` was not passed through the official validator** — doing so caused excessive
+  system resource usage and froze the desktop session. It passed independent streaming structural
+  checks instead (`BAD_FIELD_ROWS: 0`, `EMPTY_S1_ROWS: 0`); the same streaming check on
+  `matching_results.tsv` reported `BAD_FIELD_ROWS: 0`.
+- `--check-ids` was not run.
+
 Not yet done:
 
-- **Full test inference has not been run**, and no submission has been generated or scored.
+- The submission has only been prepared and validated locally; no upload or leaderboard result is
+  recorded in this repository.
 
 ## Limitations
 
@@ -514,9 +559,10 @@ Not yet done:
 - Candidate recall is ~97% on the training sample; missed links (mostly Indian cross-script names and
   renamed businesses at weak addresses) cannot be recovered by the matcher.
 - The base model and second stage are trained on a 20k-S1 training sample.
-- Full-scale runtime and memory figures are estimates extrapolated from measured runs.
+- Full-scale runtime, memory and disk figures come from a single run on the development machine.
 - Entity-cache building and candidate generation require `fork`: run them on Linux (or WSL2), not native Windows.
-- `candidate_pairs.tsv` for the full test set is large (several GB).
+- `candidate_pairs.tsv` for the full test set is large (≈ 8.0 GB); the official validator could not
+  process it on the development machine, so it was checked with streaming structural checks instead.
 
 ## License
 
