@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
+import numpy as np
+
 
 def fbeta(
     precision: float,
@@ -94,3 +96,36 @@ def macro_f05(
         )
 
     return sum(scores) / len(scores)
+
+def f05_from_counts(
+    true_positive: np.ndarray,
+    n_predicted: np.ndarray,
+    n_actual: np.ndarray,
+    beta: float = 0.5,
+) -> np.ndarray:
+    """
+    Vectorized per-S1 F-beta from match counts, with the same rules as
+    ``set_f05``:
+
+    - no predictions and no true matches  -> 1.0
+    - no predictions but true matches      -> 0.0
+    - predictions but no true matches      -> 0.0
+    - otherwise ``fbeta(precision, recall)``
+    """
+    tp = np.asarray(true_positive, dtype=np.float64)
+    pred = np.asarray(n_predicted, dtype=np.float64)
+    actual = np.asarray(n_actual, dtype=np.float64)
+
+    precision = np.divide(tp, pred, out=np.zeros_like(tp), where=pred > 0)
+    recall = np.divide(tp, actual, out=np.zeros_like(tp), where=actual > 0)
+
+    b2 = beta ** 2
+    denominator = b2 * precision + recall
+    score = np.divide(
+        (1.0 + b2) * precision * recall,
+        denominator,
+        out=np.zeros_like(tp),
+        where=denominator > 0,
+    )
+
+    return np.where((pred == 0) & (actual == 0), 1.0, score)
